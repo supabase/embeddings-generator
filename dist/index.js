@@ -58651,7 +58651,7 @@ var main_awaiter = (undefined && undefined.__awaiter) || function (thisArg, _arg
 function generateEmbeddings({ shouldRefresh = false, supabaseUrl, supabaseServiceKey, openaiKey, docsRootPath }) {
     return main_awaiter(this, void 0, void 0, function* () {
         const supabaseClient = (0,main.createClient)(supabaseUrl, supabaseServiceKey, {
-            db: { schema: 'docs' },
+            db: { schema: 'public' },
             auth: {
                 persistSession: false,
                 autoRefreshToken: false
