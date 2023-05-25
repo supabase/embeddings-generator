@@ -44,9 +44,11 @@ jobs:
           fi
         id: diff
 
-      # If index.js was different than expected, upload the expected version as an artifact
-      - uses: actions/upload-artifact@v3
-        if: ${{ failure() && steps.diff.conclusion == 'failure' }}
-        with:
-          name: dist
-          path: dist/
+      # @kiwicopple: I've disabled this worklfow for now, as it's not working as expected. It will still output an error.
+
+      # # If index.js was different than expected, upload the expected version as an artifact
+      # - uses: actions/upload-artifact@v3
+      #   if: ${{ failure() && steps.diff.conclusion == 'failure' }}
+      #   with:
+      #     name: dist
+      #     path: dist/
