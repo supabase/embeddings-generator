@@ -5,12 +5,13 @@
   "description": "A GitHub Action that converts your markdown files into embeddings and stores them in your Postgres/Supabase database, allowing you to perform vector similarity search inside your documentation and website.",
   "main": "src/main.ts",
   "scripts": {
+    "build": "tsc",
     "format": "prettier --write '**/*.ts'",
     "format-check": "prettier --check '**/*.ts'",
     "lint": "eslint src/**/*.ts",
     "package": "ncc build --source-map --license licenses.txt",
     "test": "jest",
-    "all": "npm run format && npm run package"
+    "all": "npm run build && npm run format && npm run package"
   },
   "repository": {
     "type": "git",
