@@ -1,8 +1,8 @@
 {
-  "name": "supabase-vector-embeddings-github-action",
-  "version": "0.0.3",
+  "name": "supabase-embeddings-generator",
+  "version": "0.0.4",
   "private": true,
-  "description": "GitHub Action to generate embeddings from your Knowledge Base to use with Supabase Vector.",
+  "description": "A GitHub Action that converts your markdown files into embeddings and stores them in your Postgres/Supabase database, allowing you to perform vector similarity search inside your documentation and website.",
   "main": "src/main.ts",
   "scripts": {
     "format": "prettier --write '**/*.ts'",

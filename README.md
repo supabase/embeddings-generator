@@ -1,13 +1,9 @@
 # Supabase Embeddings Generator
 
-A GitHub Action to automatically convert your markdown files into embeddings, and store them in your Postgres databases.
-
+A GitHub Action that converts your markdown files into embeddings and stores them in your Postgres/Supabase database, allowing you to perform vector similarity search inside your documentation and website.
 ## Usage
 
-This GitHub Action works with Supabase Vector to process your knowledge base and store them as embeddings in your Supabase Database allowing you to perform vector similarity search.
-
-This action is a companion to the [`headless-vector-search`](https://github.com/supabase/headless-vector-search) repo, which is used to store and retrieve the embeddings using [OpenAI](https://openai.com) and [Supabase](https://supabase.com)
-
+This action is a companion to the [`headless-vector-search`](https://github.com/supabase/headless-vector-search) repo, which is used to store and retrieve the embeddings using [OpenAI](https://openai.com) and [Supabase](https://supabase.com).
 
 In your knowledge base repository, create a new action called `.github/workflows/generate_embeddings.yml` with the following content:
 
@@ -33,7 +29,7 @@ jobs:
 
 Make sure to set `SUPABASE_SERVICE_ROLE_KEY`, and `OPENAI_KEY` as repository secrets in your repo settings (settings > secrets > actions).
 
-See the instructions in the [`headless-vector-search`](https://github.com/supabase/headless-vector-search) for more information on how to query your database.
+See the instructions in the [`headless-vector-search`](https://github.com/supabase/headless-vector-search) for more information on how to query your database from your website.
 
 ## Develop
 
