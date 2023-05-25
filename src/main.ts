@@ -21,7 +21,7 @@ async function generateEmbeddings({
   docsRootPath: string
 }) {
   const supabaseClient = createClient(supabaseUrl, supabaseServiceKey, {
-    db: {schema: 'public'}, // TODO change to different schema?
+    db: {schema: 'docs'},
     auth: {
       persistSession: false,
       autoRefreshToken: false
