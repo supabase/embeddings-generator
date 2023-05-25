@@ -13,9 +13,9 @@ npm run package
 
 ## Publish
 
-- Make sure `/dist` is up to date: `npm run package`
 - Update the version in [package.json](package.json)
-- Commit the version update: `git commit -m -a "Update to version x.x.x"`
+- Make sure `/dist` is up to date: `npm run package`
+- Commit the version update: `git commit -a -m "Update to version x.x.x"`
 - Push a new tag
 
 ```bash
