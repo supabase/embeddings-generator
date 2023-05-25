@@ -1,19 +1,19 @@
-name: 'supabase-vector-embeddings'
+name: 'supabase-embeddings-generator'
 description: 'Generate embeddings from your Knowledge Base to use with Supabase Vector.'
 author: 'Supabase'
 inputs:
   supabase-url:
     required: true
-    description: 'your Supabase project URL'
+    description: 'Your Supabase project URL'
   supabase-service-role-key:
     required: true
-    description: 'your Supabase service role key'
+    description: 'Your Supabase SERVICE_ROLE key'
   openai-key:
     required: true
-    description: 'your OpenAI API key'
+    description: 'Your OpenAI API key'
   docs-root-path:
     required: true
-    description: 'the path to the root of your knowledge base'
+    description: 'The path to the root of your knowledge base or docs folder'
     default: 'docs'
 runs:
   using: 'node16'
