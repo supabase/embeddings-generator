@@ -1,8 +1,8 @@
 {
-  "name": "typescript-action",
-  "version": "0.0.0",
+  "name": "supabase-vector-embeddings-github-action",
+  "version": "0.0.1",
   "private": true,
-  "description": "TypeScript template action",
+  "description": "GitHub Action to generate embeddings from your Knowledge Base to use with Supabase Vector.",
   "main": "src/main.ts",
   "scripts": {
     "format": "prettier --write '**/*.ts'",
@@ -14,7 +14,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/actions/typescript-action.git"
+    "url": "git+https://github.com/supabase/supabase-vector-embeddings-github-action"
   },
   "keywords": [
     "actions",

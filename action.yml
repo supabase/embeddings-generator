@@ -1,6 +1,6 @@
-name: 'Your name here'
-description: 'Provide a description here'
-author: 'Your name or organization here'
+name: 'supabase-vector-embeddings'
+description: 'Generate embeddings from your Knowledge Base to use with Supabase Vector.'
+author: 'Supabase'
 inputs:
   supabase-url:
     required: true
