@@ -58665,7 +58665,7 @@ function generateEmbeddings({ shouldRefresh = false, supabaseUrl, supabaseServic
         const embeddingSources = (yield walk(docsRootPath))
             .filter(({ path }) => /\.mdx?$/.test(path))
             .filter(({ path }) => !ignoredFiles.includes(path))
-            .map(entry => new MarkdownSource('guide', entry.path));
+            .map(entry => new MarkdownSource('markdown', entry.path));
         console.log(`Discovered ${embeddingSources.length} pages`);
         if (!shouldRefresh) {
             console.log('Checking which pages are new or have changed');

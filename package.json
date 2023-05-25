@@ -1,6 +1,6 @@
 {
   "name": "supabase-vector-embeddings-github-action",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "description": "GitHub Action to generate embeddings from your Knowledge Base to use with Supabase Vector.",
   "main": "src/main.ts",
