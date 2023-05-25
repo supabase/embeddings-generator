@@ -1,105 +1,52 @@
-<p align="center">
-  <a href="https://github.com/actions/typescript-action/actions"><img alt="typescript-action status" src="https://github.com/actions/typescript-action/workflows/build-test/badge.svg"></a>
-</p>
+# Supabase Embeddings Generator
 
-# Create a JavaScript Action using TypeScript
+A GitHub Action that converts your markdown files into embeddings and stores them in your Postgres/Supabase database, allowing you to perform vector similarity search inside your documentation and website.
 
-Use this template to bootstrap the creation of a TypeScript action.:rocket:
+## Usage
 
-This template includes compilation support, tests, a validation workflow, publishing, and versioning guidance.  
+This action is a companion to the [`headless-vector-search`](https://github.com/supabase/headless-vector-search) repo, which is used to store and retrieve the embeddings using [OpenAI](https://openai.com) and [Supabase](https://supabase.com).
 
-If you are new, there's also a simpler introduction.  See the [Hello World JavaScript Action](https://github.com/actions/hello-world-javascript-action)
+In your knowledge base repository, create a new action called `.github/workflows/generate_embeddings.yml` with the following content:
 
-## Create an action from this template
+```yml
+name: 'generate_embeddings'
+on: # run on main branch changes
+  push:
+    branches:
+      - main
 
-Click the `Use this Template` and provide the new repo details for your action
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: supabase/supabase-vector-embeddings-github-action@v0.0.1
+        with:
+          supabase-url: 'https://your-project-ref.supabase.co'
+          supabase-service-role-key: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          openai-key: ${{ secrets.OPENAI_KEY }}
+          docs-root-path: 'docs' # the path to the root of your md(x) files
+```
 
-## Code in Main
+Make sure to set `SUPABASE_SERVICE_ROLE_KEY`, and `OPENAI_KEY` as repository secrets in your repo settings (settings > secrets > actions).
 
-> First, you'll need to have a reasonably modern version of `node` handy. This won't work with versions older than 9, for instance.
+See the instructions in the [`headless-vector-search`](https://github.com/supabase/headless-vector-search) for more information on how to query your database from your website.
 
-Install the dependencies  
+## Develop
+
 ```bash
-$ npm install
+npm install
+npm run package
 ```
 
-Build the typescript and package it for distribution
+## Publish
+
+- Update the version in [package.json](package.json)
+- Make sure `/dist` is up to date: `npm run package`
+- Commit the version update: `git commit -a -m "Update to version x.x.x"`
+- Push a new tag
+
 ```bash
-$ npm run build && npm run package
+git tag -a -m "Update to version x.x.x" vx.x.x
+git push --follow-tags
 ```
-
-Run the tests :heavy_check_mark:  
-```bash
-$ npm test
-
- PASS  ./index.test.js
-  ✓ throws invalid number (3ms)
-  ✓ wait 500 ms (504ms)
-  ✓ test runs (95ms)
-
-...
-```
-
-## Change action.yml
-
-The action.yml defines the inputs and output for your action.
-
-Update the action.yml with your name, description, inputs and outputs for your action.
-
-See the [documentation](https://help.github.com/en/articles/metadata-syntax-for-github-actions)
-
-## Change the Code
-
-Most toolkit and CI/CD operations involve async operations so the action is run in an async function.
-
-```javascript
-import * as core from '@actions/core';
-...
-
-async function run() {
-  try { 
-      ...
-  } 
-  catch (error) {
-    core.setFailed(error.message);
-  }
-}
-
-run()
-```
-
-See the [toolkit documentation](https://github.com/actions/toolkit/blob/master/README.md#packages) for the various packages.
-
-## Publish to a distribution branch
-
-Actions are run from GitHub repos so we will checkin the packed dist folder. 
-
-Then run [ncc](https://github.com/zeit/ncc) and push the results:
-```bash
-$ npm run package
-$ git add dist
-$ git commit -a -m "prod dependencies"
-$ git push origin releases/v1
-```
-
-Note: We recommend using the `--license` option for ncc, which will create a license file for all of the production node modules used in your project.
-
-Your action is now published! :rocket: 
-
-See the [versioning documentation](https://github.com/actions/toolkit/blob/master/docs/action-versioning.md)
-
-## Validate
-
-You can now validate the action by referencing `./` in a workflow in your repo (see [test.yml](.github/workflows/test.yml))
-
-```yaml
-uses: ./
-with:
-  milliseconds: 1000
-```
-
-See the [actions tab](https://github.com/actions/typescript-action/actions) for runs of this action! :rocket:
-
-## Usage:
-
-After testing you can [create a v1 tag](https://github.com/actions/toolkit/blob/master/docs/action-versioning.md) to reference the stable and latest V1 action
