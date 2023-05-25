@@ -2,10 +2,19 @@ name: 'Your name here'
 description: 'Provide a description here'
 author: 'Your name or organization here'
 inputs:
-  milliseconds: # change this
+  supabase-url:
     required: true
-    description: 'input description here'
-    default: 'default value if applicable'
+    description: 'your Supabase project URL'
+  supabase-service-role-key:
+    required: true
+    description: 'your Supabase service role key'
+  openai-key:
+    required: true
+    description: 'your OpenAI API key'
+  docs-root-path:
+    required: true
+    description: 'the path to the root of your knowledge base'
+    default: 'docs'
 runs:
   using: 'node16'
   main: 'dist/index.js'

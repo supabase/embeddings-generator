@@ -1,6 +1,6 @@
 export type Json = Record<
   string,
-  string | number | boolean | null | Json[] | { [key: string]: Json }
+  string | number | boolean | null | Json[] | {[key: string]: Json}
 >
 
 export type Section = {
@@ -14,7 +14,11 @@ export abstract class BaseSource {
   meta?: Json
   sections?: Section[]
 
-  constructor(public source: string, public path: string, public parentPath?: string) {}
+  constructor(
+    public source: string,
+    public path: string,
+    public parentPath?: string
+  ) {}
 
-  abstract load(): Promise<{ checksum: string; meta?: Json; sections: Section[] }>
+  abstract load(): Promise<{checksum: string; meta?: Json; sections: Section[]}>
 }

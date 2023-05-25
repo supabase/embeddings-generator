@@ -21,4 +21,7 @@ jobs:
       - uses: actions/checkout@v3
       - uses: ./
         with:
-          milliseconds: 1000
+          supabase-url: 'https://nihypcognmeejjrivnde.supabase.co'
+          supabase-service-role-key: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          openai-key: ${{ secrets.OPENAI_KEY }}
+          docs-root-path: 'docs'
