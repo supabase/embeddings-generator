@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: supabase/supabase-vector-embeddings-github-action@v0.0.1
+      - uses: supabase/supabase-embeddings-generator@v0.0.4
         with:
           supabase-url: 'https://your-project-ref.supabase.co'
           supabase-service-role-key: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
