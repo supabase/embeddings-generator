@@ -1,3 +1,6 @@
+# Maintainers
+
+Instructions for developing and releasing this action.
 
 ## Develop
 

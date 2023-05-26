@@ -2,9 +2,11 @@
 
 A GitHub Action that converts your markdown files into embeddings and stores them in your Postgres/Supabase database, allowing you to perform vector similarity search inside your documentation and website.
 
+This action is a companion to the [`headless-vector-search`](https://github.com/supabase/headless-vector-search) repo, which is used to store and retrieve the embeddings using [OpenAI](https://openai.com) and [Supabase](https://supabase.com).
+
 ## Usage
 
-This action is a companion to the [`headless-vector-search`](https://github.com/supabase/headless-vector-search) repo, which is used to store and retrieve the embeddings using [OpenAI](https://openai.com) and [Supabase](https://supabase.com).
+You can find this action on the [GitHub Marketplace](https://github.com/marketplace/actions/supabase-embeddings-generator).
 
 In your knowledge base repository, create a new action called `.github/workflows/generate_embeddings.yml` with the following content:
 
@@ -20,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: supabase/supabase-embeddings-generator@v0.0.4
+      - uses: supabase/supabase-embeddings-generator@v0.x.x # Find the latest version in the Marketplace
         with:
           supabase-url: 'https://your-project-ref.supabase.co'
           supabase-service-role-key: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -32,21 +34,10 @@ Make sure to set `SUPABASE_SERVICE_ROLE_KEY`, and `OPENAI_KEY` as repository sec
 
 See the instructions in the [`headless-vector-search`](https://github.com/supabase/headless-vector-search) for more information on how to query your database from your website.
 
-## Develop
+## Developers
 
-```bash
-npm install
-npm run package
-```
+See details in [MAINTAINERS.md](https://github.com/supabase/embeddings-generator/blob/main/MAINTAINERS.md)
 
-## Publish
+## License
 
-- Update the version in [package.json](package.json)
-- Make sure `/dist` is up to date: `npm run package`
-- Commit the version update: `git commit -a -m "Update to version x.x.x"`
-- Push a new tag
-
-```bash
-git tag -a -m "Update to version x.x.x" vx.x.x
-git push --follow-tags
-```
+[MIT](https://github.com/supabase/embeddings-generator/blob/main/LICENSE)
