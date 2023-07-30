@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: supabase/supabase-embeddings-generator@v0.x.x # Find the latest version in the Marketplace
+      - uses: supabase/embeddings-generator@v0.x.x # Find the latest version in the Marketplace
         with:
           supabase-url: 'https://your-project-ref.supabase.co'
           supabase-service-role-key: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
