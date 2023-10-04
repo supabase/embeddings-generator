@@ -34,7 +34,7 @@
     "mdast-util-to-string": "^3.2.0",
     "micromark-extension-mdxjs": "^1.0.1",
     "openai": "^3.2.1",
-    "unist-builder": "^3.0.1",
+    "unist-builder": "^4.0.0",
     "unist-util-filter": "^4.0.1",
     "uuid": "^9.0.1"
   },
