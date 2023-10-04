@@ -36,12 +36,12 @@
     "openai": "^3.2.1",
     "unist-builder": "^3.0.1",
     "unist-util-filter": "^4.0.1",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.1"
   },
   "devDependencies": {
     "@types/estree": "^1.0.1",
     "@types/node": "^20.4.5",
-    "@types/uuid": "^9.0.2",
+    "@types/uuid": "^9.0.4",
     "@typescript-eslint/parser": "^5.62.0",
     "@vercel/ncc": "^0.36.1",
     "eslint": "^8.42.0",
