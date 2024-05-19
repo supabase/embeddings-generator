@@ -32,6 +32,8 @@ jobs:
 
 Make sure to set `SUPABASE_SERVICE_ROLE_KEY`, and `OPENAI_KEY` as repository secrets in your repo settings (settings > secrets > actions).
 
+Then add your markdown files to the directory you specified with the `docs-root-path`. The action will convert the markdown files into embeddings and store them in your Supabase database.
+
 See the instructions in the [`headless-vector-search`](https://github.com/supabase/headless-vector-search) for more information on how to query your database from your website.
 
 ## Developers
