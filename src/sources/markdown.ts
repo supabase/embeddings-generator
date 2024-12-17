@@ -1,3 +1,13 @@
+import {
+  encode,
+  encodeChat,
+  decode,
+  isWithinTokenLimit,
+  encodeGenerator,
+  decodeGenerator,
+  decodeAsyncGenerator
+} from 'gpt-tokenizer'
+import matter from 'gray-matter'
 import {createHash} from 'crypto'
 import {ObjectExpression} from 'estree'
 import {readFile} from 'fs/promises'
@@ -129,30 +139,32 @@ export function parseHeading(heading: string): {
  */
 export function processMdxForSearch(content: string): ProcessedMdx {
   const checksum = createHash('sha256').update(content).digest('base64')
+  const {content: rawContent, data: metadata} = matter(content)
 
-  const mdxTree = fromMarkdown(content, {
+  const mdxTree = fromMarkdown(rawContent, {
     extensions: [mdxjs()],
     mdastExtensions: [mdxFromMarkdown()]
   })
 
-  const meta = extractMetaExport(mdxTree)
+  //const meta = extractMetaExport(mdxTree)
 
-  const serializableMeta: Json = meta && JSON.parse(JSON.stringify(meta))
+  const serializableMeta: Json =
+    metadata && JSON.parse(JSON.stringify(metadata))
 
   // Remove all MDX elements from markdown
-  const mdTree = filter(
-    mdxTree,
-    node =>
-      ![
-        'mdxjsEsm',
-        'mdxJsxFlowElement',
-        'mdxJsxTextElement',
-        'mdxFlowExpression',
-        'mdxTextExpression'
-      ].includes(node.type)
-  )
+  // const mdTree = filter(
+  //   mdxTree,
+  //   node =>
+  //     ![
+  //       'mdxjsEsm',
+  //       // 'mdxJsxFlowElement',
+  //       // 'mdxJsxTextElement',
+  //       // 'mdxFlowExpression',
+  //       // 'mdxTextExpression'
+  //     ].includes(node.type)
+  // )
 
-  if (!mdTree) {
+  if (!rawContent) {
     return {
       checksum,
       meta: serializableMeta,
@@ -160,31 +172,69 @@ export function processMdxForSearch(content: string): ProcessedMdx {
     }
   }
 
-  const sectionTrees = splitTreeBy(mdTree, node => node.type === 'heading')
-
   const slugger = new GithubSlugger()
 
-  const sections = sectionTrees.map(tree => {
-    const [firstNode] = tree.children
-    const content = toMarkdown(tree)
+  // We want to chunk this into 400 token chunks, w/ 100 token overlap
+  const contentTokens = encode(content)
+  const chunks = []
+  const chunkSize = 400
+  const overlap = 100
 
-    const rawHeading: string | undefined =
-      firstNode.type === 'heading' ? toString(firstNode) : undefined
+  for (let i = 0; i < contentTokens.length; i += chunkSize - overlap) {
+    chunks.push(contentTokens.slice(i, i + chunkSize))
+  }
 
-    if (!rawHeading) {
-      return {content}
+  // Now we need to decode these chunks
+  const decodedChunks = chunks.map(decode)
+
+  const sections = decodedChunks.map((chunkText, i, chunkArray) => {
+    const content = chunkText.trim()
+
+    const localTree = fromMarkdown(content, {
+      extensions: [mdxjs()],
+      mdastExtensions: [mdxFromMarkdown()]
+    })
+    const headings = filter(localTree, node => node.type === 'heading')
+    const [first] = headings.children
+    const heading = first?.type === 'heading' ? toString(first) : undefined
+    const slug = slugger.slug(heading)
+
+    if (heading && slug) {
+      return {
+        content,
+        heading,
+        slug
+      }
     }
-
-    const {heading, customAnchor} = parseHeading(rawHeading)
-
-    const slug = slugger.slug(customAnchor ?? heading)
 
     return {
-      content,
-      heading,
-      slug
+      content
     }
   })
+
+  // const sectionTrees = splitTreeBy(mdTree, node => node.type === 'heading')
+
+  // const sections = sectionTrees.map(tree => {
+  //   const [firstNode] = tree.children
+  //   const content = toMarkdown(tree)
+
+  //   const rawHeading: string | undefined =
+  //     firstNode.type === 'heading' ? toString(firstNode) : undefined
+
+  //   if (!rawHeading) {
+  //     return {content}
+  //   }
+
+  //   const {heading, customAnchor} = parseHeading(rawHeading)
+
+  //   const slug = slugger.slug(customAnchor ?? heading)
+
+  //   return {
+  //     content,
+  //     heading,
+  //     slug
+  //   }
+  // })
 
   return {
     checksum,

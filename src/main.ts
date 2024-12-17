@@ -70,12 +70,13 @@ async function generateEmbeddings({
 
       // We use checksum to determine if this page & its sections need to be regenerated
       if (!shouldRefresh && existingPage?.checksum === checksum) {
-        const existingParentPage = existingPage?.parentPage as Singular<
+        const existingParentPage = existingPage.parentPage as Singular<
           typeof existingPage.parentPage
         >
 
         // If parent page changed, update it
-        if (existingParentPage?.path !== parentPath) {
+        //@ts-expect-error TS2531: Object is possibly 'null'.
+        if (existingParentPage && existingParentPage?.path !== parentPath) {
           console.log(
             `[${path}] Parent page has changed. Updating to '${parentPath}'...`
           )

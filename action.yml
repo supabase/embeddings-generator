@@ -1,6 +1,6 @@
 name: 'supabase-embeddings-generator'
 description: 'Generate embeddings from your Knowledge Base to use with Supabase Vector.'
-author: 'Supabase'
+author: 'Brennan'
 inputs:
   supabase-url:
     required: true
@@ -16,5 +16,5 @@ inputs:
     description: 'The path to the root of your knowledge base or docs folder'
     default: 'docs'
 runs:
-  using: 'node16'
+  using: 'node20'
   main: 'dist/index.js'
