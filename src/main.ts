@@ -10,12 +10,14 @@ import {walk} from './sources/util'
 async function generateEmbeddings({
   shouldRefresh = false,
   supabaseUrl,
+  embeddingModel,
   supabaseServiceKey,
   openaiKey,
   docsRootPath
 }: {
   shouldRefresh?: boolean
   supabaseUrl: string
+  embeddingModel: string
   supabaseServiceKey: string
   openaiKey: string
   docsRootPath: string
@@ -193,7 +195,7 @@ async function generateEmbeddings({
           const openai = new OpenAIApi(configuration)
 
           const embeddingResponse = await openai.createEmbedding({
-            model: 'text-embedding-ada-002',
+            model: embeddingModel,
             input
           })
 
@@ -272,11 +274,14 @@ async function run(): Promise<void> {
     const supabaseServiceKey: string = core.getInput(
       'supabase-service-role-key'
     )
+    const embeddingModel: string =
+      core.getInput('embedding-model') || 'text-embedding-ada-002'
     const openaiKey: string = core.getInput('openai-key')
     const docsRootPath: string = core.getInput('docs-root-path')
     await generateEmbeddings({
       supabaseUrl,
       supabaseServiceKey,
+      embeddingModel,
       openaiKey,
       docsRootPath
     })
