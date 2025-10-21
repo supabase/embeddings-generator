@@ -1,6 +1,6 @@
 {
   "name": "supabase-embeddings-generator",
-  "version": "0.0.4",
+  "version": "0.0.6",
   "private": true,
   "description": "A GitHub Action that converts your markdown files into embeddings and stores them in your Postgres/Supabase database, allowing you to perform vector similarity search inside your documentation and website.",
   "main": "src/main.ts",
