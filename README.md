@@ -27,10 +27,13 @@ jobs:
           supabase-url: 'https://your-project-ref.supabase.co'
           supabase-service-role-key: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           openai-key: ${{ secrets.OPENAI_KEY }}
+          embedding-model: 'text-embedding-3-large' # optional; defaults to text-embedding-ada-002
           docs-root-path: 'docs' # the path to the root of your md(x) files
 ```
 
 Make sure to set `SUPABASE_SERVICE_ROLE_KEY`, and `OPENAI_KEY` as repository secrets in your repo settings (settings > secrets > actions).
+
+You can override the OpenAI embedding model by providing the optional `embedding-model` input (defaults to `text-embedding-ada-002` if not supplied).
 
 See the instructions in the [`headless-vector-search`](https://github.com/supabase/headless-vector-search) for more information on how to query your database from your website.
 

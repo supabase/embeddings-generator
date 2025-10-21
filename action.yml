@@ -8,6 +8,9 @@ inputs:
   supabase-service-role-key:
     required: true
     description: 'Your Supabase SERVICE_ROLE key'
+  embedding-model:
+    required: false
+    description: 'The embedding model to use. Defaults to text-embedding-ada-002'
   openai-key:
     required: true
     description: 'Your OpenAI API key'
