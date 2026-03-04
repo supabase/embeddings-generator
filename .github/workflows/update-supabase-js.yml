@@ -14,12 +14,15 @@ on:
         default: "manual"
 
 permissions:
-  pull-requests: write
-  contents: write
+  pull-requests: read
+  contents: read
 
 jobs:
   update-supabase-js:
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-supabase-update-${{ inputs.version }}
+      cancel-in-progress: false
 
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
@@ -34,7 +37,12 @@ jobs:
           cache-dependency-path: package-lock.json
 
       - name: Update @supabase/supabase-js
-        run: npm i @supabase/supabase-js@${{ inputs.version }}
+        run: |
+          npm pkg set "dependencies.@supabase/supabase-js=${{ inputs.version }}"
+          npm install --ignore-scripts
+
+      - name: Rebuild dist
+        run: npm run package
 
       - name: Generate token
         id: app-token
