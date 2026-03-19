@@ -7440,8 +7440,9 @@ async function navigatorLock(name, acquireTimeout, fn) {
         console.log('@supabase/gotrue-js: navigatorLock: acquire lock', name, acquireTimeout);
     }
     const abortController = new globalThis.AbortController();
+    let acquireTimeoutTimer;
     if (acquireTimeout > 0) {
-        setTimeout(() => {
+        acquireTimeoutTimer = setTimeout(() => {
             abortController.abort();
             if (exports.internals.debug) {
                 console.log('@supabase/gotrue-js: navigatorLock acquire timed out', name);
@@ -7468,6 +7469,12 @@ async function navigatorLock(name, acquireTimeout, fn) {
                 signal: abortController.signal,
             }, async (lock) => {
             if (lock) {
+                // Lock acquired — cancel the acquire-timeout timer so it cannot fire
+                // while fn() is running. Without this, a delayed timeout abort would
+                // set signal.aborted = true even though we already hold the lock,
+                // causing a subsequent steal to be misclassified as "our timeout
+                // fired" and triggering a spurious steal-back cascade.
+                clearTimeout(acquireTimeoutTimer);
                 if (exports.internals.debug) {
                     console.log('@supabase/gotrue-js: navigatorLock: acquired', name, lock.name);
                 }
@@ -7502,55 +7509,78 @@ async function navigatorLock(name, acquireTimeout, fn) {
                     // pretend the lock is acquired in the name of backward compatibility
                     // and user experience and just run the function.
                     console.warn('@supabase/gotrue-js: Navigator LockManager returned a null lock when using #request without ifAvailable set to true, it appears this browser is not following the LockManager spec https://developer.mozilla.org/en-US/docs/Web/API/LockManager/request');
+                    clearTimeout(acquireTimeoutTimer);
                     return await fn();
                 }
             }
         });
     }
     catch (e) {
+        // Always clear the acquire timeout once the request settles, so it cannot
+        // fire later and incorrectly abort/log after a rejection.
+        if (acquireTimeout > 0) {
+            clearTimeout(acquireTimeoutTimer);
+        }
         if ((e === null || e === void 0 ? void 0 : e.name) === 'AbortError' && acquireTimeout > 0) {
-            // The lock acquisition was aborted because the timeout fired while the
-            // request was still pending. This typically means another lock holder is
-            // not releasing the lock, possibly due to React Strict Mode's
-            // double-mount/unmount behavior or a component unmounting mid-operation,
-            // leaving an orphaned lock.
-            //
-            // Recovery: use { steal: true } to forcefully acquire the lock. Per the
-            // Web Locks API spec, this releases any currently held lock with the same
-            // name and grants the request immediately, preempting any queued requests.
-            // The previous holder's callback continues running to completion but no
-            // longer holds the lock for exclusion purposes.
-            //
-            // See: https://github.com/supabase/supabase/issues/42505
-            if (exports.internals.debug) {
-                console.log('@supabase/gotrue-js: navigatorLock: acquire timeout, recovering by stealing lock', name);
-            }
-            console.warn(`@supabase/gotrue-js: Lock "${name}" was not released within ${acquireTimeout}ms. ` +
-                'This may indicate an orphaned lock from a component unmount (e.g., React Strict Mode). ' +
-                'Forcefully acquiring the lock to recover.');
-            return await Promise.resolve().then(() => globalThis.navigator.locks.request(name, {
-                mode: 'exclusive',
-                steal: true,
-            }, async (lock) => {
-                if (lock) {
-                    if (exports.internals.debug) {
-                        console.log('@supabase/gotrue-js: navigatorLock: recovered (stolen)', name, lock.name);
-                    }
-                    try {
-                        return await fn();
-                    }
-                    finally {
+            if (abortController.signal.aborted) {
+                // OUR timeout fired — the lock is genuinely orphaned. Steal it.
+                //
+                // The lock acquisition was aborted because the timeout fired while the
+                // request was still pending. This typically means another lock holder is
+                // not releasing the lock, possibly due to React Strict Mode's
+                // double-mount/unmount behavior or a component unmounting mid-operation,
+                // leaving an orphaned lock.
+                //
+                // Recovery: use { steal: true } to forcefully acquire the lock. Per the
+                // Web Locks API spec, this releases any currently held lock with the same
+                // name and grants the request immediately, preempting any queued requests.
+                // The previous holder's callback continues running to completion but no
+                // longer holds the lock for exclusion purposes.
+                //
+                // See: https://github.com/supabase/supabase/issues/42505
+                if (exports.internals.debug) {
+                    console.log('@supabase/gotrue-js: navigatorLock: acquire timeout, recovering by stealing lock', name);
+                }
+                console.warn(`@supabase/gotrue-js: Lock "${name}" was not released within ${acquireTimeout}ms. ` +
+                    'This may indicate an orphaned lock from a component unmount (e.g., React Strict Mode). ' +
+                    'Forcefully acquiring the lock to recover.');
+                return await Promise.resolve().then(() => globalThis.navigator.locks.request(name, {
+                    mode: 'exclusive',
+                    steal: true,
+                }, async (lock) => {
+                    if (lock) {
                         if (exports.internals.debug) {
-                            console.log('@supabase/gotrue-js: navigatorLock: released (stolen)', name, lock.name);
+                            console.log('@supabase/gotrue-js: navigatorLock: recovered (stolen)', name, lock.name);
+                        }
+                        try {
+                            return await fn();
+                        }
+                        finally {
+                            if (exports.internals.debug) {
+                                console.log('@supabase/gotrue-js: navigatorLock: released (stolen)', name, lock.name);
+                            }
                         }
                     }
+                    else {
+                        // This should not happen with steal: true, but handle gracefully.
+                        console.warn('@supabase/gotrue-js: Navigator LockManager returned null lock even with steal: true');
+                        return await fn();
+                    }
+                }));
+            }
+            else {
+                // We HELD the lock but another request stole it from us.
+                // Per the Web Locks spec, our fn() callback is still running as an
+                // orphaned background task — do NOT steal back. Stealing back would
+                // cause a cascade (A steals B, B steals A, ...) and run fn() a second
+                // time concurrently, corrupting auth state.
+                // Convert to a typed error so callers (e.g. _autoRefreshTokenTick)
+                // can handle/filter it without it leaking to Sentry as a raw AbortError.
+                if (exports.internals.debug) {
+                    console.log('@supabase/gotrue-js: navigatorLock: lock was stolen by another request', name);
                 }
-                else {
-                    // This should not happen with steal: true, but handle gracefully.
-                    console.warn('@supabase/gotrue-js: Navigator LockManager returned null lock even with steal: true');
-                    return await fn();
-                }
-            }));
+                throw new NavigatorLockAcquireTimeoutError(`Lock "${name}" was released because another request stole it`);
+            }
         }
         throw e;
     }
@@ -7733,7 +7763,7 @@ exports.version = void 0;
 // - Debugging and support (identifying which version is running)
 // - Telemetry and logging (version reporting in errors/analytics)
 // - Ensuring build artifacts match the published package version
-exports.version = '2.100.0-canary.0';
+exports.version = '2.99.3';
 //# sourceMappingURL=version.js.map
 
 /***/ }),
@@ -10037,1833 +10067,6 @@ var __rewriteRelativeImportExtension;
 
 /***/ }),
 
-/***/ 3513:
-/***/ ((module) => {
-
-"use strict";
-
-var __defProp = Object.defineProperty;
-var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
-var __getOwnPropNames = Object.getOwnPropertyNames;
-var __hasOwnProp = Object.prototype.hasOwnProperty;
-var __export = (target, all) => {
-  for (var name in all)
-    __defProp(target, name, { get: all[name], enumerable: true });
-};
-var __copyProps = (to, from, except, desc) => {
-  if (from && typeof from === "object" || typeof from === "function") {
-    for (let key of __getOwnPropNames(from))
-      if (!__hasOwnProp.call(to, key) && key !== except)
-        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
-  }
-  return to;
-};
-var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
-
-// js/phoenix/index.js
-var phoenix_exports = {};
-__export(phoenix_exports, {
-  Channel: () => Channel,
-  LongPoll: () => LongPoll,
-  Presence: () => Presence,
-  Push: () => Push,
-  Serializer: () => serializer_default,
-  Socket: () => Socket,
-  Timer: () => Timer
-});
-module.exports = __toCommonJS(phoenix_exports);
-
-// js/phoenix/utils.js
-var closure = (value) => {
-  if (typeof value === "function") {
-    return (
-      /** @type {() => T} */
-      value
-    );
-  } else {
-    let closure2 = function() {
-      return value;
-    };
-    return closure2;
-  }
-};
-
-// js/phoenix/constants.js
-var globalSelf = typeof self !== "undefined" ? self : null;
-var phxWindow = typeof window !== "undefined" ? window : null;
-var global = globalSelf || phxWindow || globalThis;
-var DEFAULT_VSN = "2.0.0";
-var DEFAULT_TIMEOUT = 1e4;
-var WS_CLOSE_NORMAL = 1e3;
-var SOCKET_STATES = (
-  /** @type {const} */
-  { connecting: 0, open: 1, closing: 2, closed: 3 }
-);
-var CHANNEL_STATES = (
-  /** @type {const} */
-  {
-    closed: "closed",
-    errored: "errored",
-    joined: "joined",
-    joining: "joining",
-    leaving: "leaving"
-  }
-);
-var CHANNEL_EVENTS = (
-  /** @type {const} */
-  {
-    close: "phx_close",
-    error: "phx_error",
-    join: "phx_join",
-    reply: "phx_reply",
-    leave: "phx_leave"
-  }
-);
-var TRANSPORTS = (
-  /** @type {const} */
-  {
-    longpoll: "longpoll",
-    websocket: "websocket"
-  }
-);
-var XHR_STATES = (
-  /** @type {const} */
-  {
-    complete: 4
-  }
-);
-var AUTH_TOKEN_PREFIX = "base64url.bearer.phx.";
-
-// js/phoenix/push.js
-var Push = class {
-  /**
-   * Initializes the Push
-   * @param {Channel} channel - The Channel
-   * @param {ChannelEvent} event - The event, for example `"phx_join"`
-   * @param {() => Record<string, unknown>} payload - The payload, for example `{user_id: 123}`
-   * @param {number} timeout - The push timeout in milliseconds
-   */
-  constructor(channel, event, payload, timeout) {
-    this.channel = channel;
-    this.event = event;
-    this.payload = payload || function() {
-      return {};
-    };
-    this.receivedResp = null;
-    this.timeout = timeout;
-    this.timeoutTimer = null;
-    this.recHooks = [];
-    this.sent = false;
-    this.ref = void 0;
-  }
-  /**
-   *
-   * @param {number} timeout
-   */
-  resend(timeout) {
-    this.timeout = timeout;
-    this.reset();
-    this.send();
-  }
-  /**
-   *
-   */
-  send() {
-    if (this.hasReceived("timeout")) {
-      return;
-    }
-    this.startTimeout();
-    this.sent = true;
-    this.channel.socket.push({
-      topic: this.channel.topic,
-      event: this.event,
-      payload: this.payload(),
-      ref: this.ref,
-      join_ref: this.channel.joinRef()
-    });
-  }
-  /**
-   *
-   * @param {string} status
-   * @param {(response: any) => void} callback
-   */
-  receive(status, callback) {
-    if (this.hasReceived(status)) {
-      callback(this.receivedResp.response);
-    }
-    this.recHooks.push({ status, callback });
-    return this;
-  }
-  reset() {
-    this.cancelRefEvent();
-    this.ref = null;
-    this.refEvent = null;
-    this.receivedResp = null;
-    this.sent = false;
-  }
-  destroy() {
-    this.cancelRefEvent();
-    this.cancelTimeout();
-  }
-  /**
-   * @private
-   */
-  matchReceive({ status, response, _ref }) {
-    this.recHooks.filter((h) => h.status === status).forEach((h) => h.callback(response));
-  }
-  /**
-   * @private
-   */
-  cancelRefEvent() {
-    if (!this.refEvent) {
-      return;
-    }
-    this.channel.off(this.refEvent);
-  }
-  cancelTimeout() {
-    clearTimeout(this.timeoutTimer);
-    this.timeoutTimer = null;
-  }
-  startTimeout() {
-    if (this.timeoutTimer) {
-      this.cancelTimeout();
-    }
-    this.ref = this.channel.socket.makeRef();
-    this.refEvent = this.channel.replyEventName(this.ref);
-    this.channel.on(this.refEvent, (payload) => {
-      this.cancelRefEvent();
-      this.cancelTimeout();
-      this.receivedResp = payload;
-      this.matchReceive(payload);
-    });
-    this.timeoutTimer = setTimeout(() => {
-      this.trigger("timeout", {});
-    }, this.timeout);
-  }
-  /**
-   * @private
-   */
-  hasReceived(status) {
-    return this.receivedResp && this.receivedResp.status === status;
-  }
-  trigger(status, response) {
-    this.channel.trigger(this.refEvent, { status, response });
-  }
-};
-
-// js/phoenix/timer.js
-var Timer = class {
-  /**
-  * @param {() => void} callback
-  * @param {(tries: number) => number} timerCalc
-  */
-  constructor(callback, timerCalc) {
-    this.callback = callback;
-    this.timerCalc = timerCalc;
-    this.timer = void 0;
-    this.tries = 0;
-  }
-  reset() {
-    this.tries = 0;
-    clearTimeout(this.timer);
-  }
-  /**
-   * Cancels any previous scheduleTimeout and schedules callback
-   */
-  scheduleTimeout() {
-    clearTimeout(this.timer);
-    this.timer = setTimeout(() => {
-      this.tries = this.tries + 1;
-      this.callback();
-    }, this.timerCalc(this.tries + 1));
-  }
-};
-
-// js/phoenix/channel.js
-var Channel = class {
-  /**
-   * @param {string} topic
-   * @param {Params | (() => Params)} params
-   * @param {Socket} socket
-   */
-  constructor(topic, params, socket) {
-    this.state = CHANNEL_STATES.closed;
-    this.topic = topic;
-    this.params = closure(params || {});
-    this.socket = socket;
-    this.bindings = [];
-    this.bindingRef = 0;
-    this.timeout = this.socket.timeout;
-    this.joinedOnce = false;
-    this.joinPush = new Push(this, CHANNEL_EVENTS.join, this.params, this.timeout);
-    this.pushBuffer = [];
-    this.stateChangeRefs = [];
-    this.rejoinTimer = new Timer(() => {
-      if (this.socket.isConnected()) {
-        this.rejoin();
-      }
-    }, this.socket.rejoinAfterMs);
-    this.stateChangeRefs.push(this.socket.onError(() => this.rejoinTimer.reset()));
-    this.stateChangeRefs.push(
-      this.socket.onOpen(() => {
-        this.rejoinTimer.reset();
-        if (this.isErrored()) {
-          this.rejoin();
-        }
-      })
-    );
-    this.joinPush.receive("ok", () => {
-      this.state = CHANNEL_STATES.joined;
-      this.rejoinTimer.reset();
-      this.pushBuffer.forEach((pushEvent) => pushEvent.send());
-      this.pushBuffer = [];
-    });
-    this.joinPush.receive("error", (reason) => {
-      this.state = CHANNEL_STATES.errored;
-      if (this.socket.hasLogger()) this.socket.log("channel", `error ${this.topic}`, reason);
-      if (this.socket.isConnected()) {
-        this.rejoinTimer.scheduleTimeout();
-      }
-    });
-    this.onClose(() => {
-      this.rejoinTimer.reset();
-      if (this.socket.hasLogger()) this.socket.log("channel", `close ${this.topic}`);
-      this.state = CHANNEL_STATES.closed;
-      this.socket.remove(this);
-    });
-    this.onError((reason) => {
-      if (this.socket.hasLogger()) this.socket.log("channel", `error ${this.topic}`, reason);
-      if (this.isJoining()) {
-        this.joinPush.reset();
-      }
-      this.state = CHANNEL_STATES.errored;
-      if (this.socket.isConnected()) {
-        this.rejoinTimer.scheduleTimeout();
-      }
-    });
-    this.joinPush.receive("timeout", () => {
-      if (this.socket.hasLogger()) this.socket.log("channel", `timeout ${this.topic}`, this.joinPush.timeout);
-      let leavePush = new Push(this, CHANNEL_EVENTS.leave, closure({}), this.timeout);
-      leavePush.send();
-      this.state = CHANNEL_STATES.errored;
-      this.joinPush.reset();
-      if (this.socket.isConnected()) {
-        this.rejoinTimer.scheduleTimeout();
-      }
-    });
-    this.on(CHANNEL_EVENTS.reply, (payload, ref) => {
-      this.trigger(this.replyEventName(ref), payload);
-    });
-  }
-  /**
-   * Join the channel
-   * @param {number} timeout
-   * @returns {Push}
-   */
-  join(timeout = this.timeout) {
-    if (this.joinedOnce) {
-      throw new Error("tried to join multiple times. 'join' can only be called a single time per channel instance");
-    } else {
-      this.timeout = timeout;
-      this.joinedOnce = true;
-      this.rejoin();
-      return this.joinPush;
-    }
-  }
-  /**
-   * Teardown the channel.
-   *
-   * Destroys and stops related timers.
-   */
-  teardown() {
-    this.pushBuffer.forEach((push) => push.destroy());
-    this.pushBuffer = [];
-    this.rejoinTimer.reset();
-    this.joinPush.destroy();
-    this.state = CHANNEL_STATES.closed;
-    this.bindings = [];
-  }
-  /**
-   * Hook into channel close
-   * @param {ChannelBindingCallback} callback
-   */
-  onClose(callback) {
-    this.on(CHANNEL_EVENTS.close, callback);
-  }
-  /**
-   * Hook into channel errors
-   * @param {ChannelOnErrorCallback} callback
-   * @return {number}
-   */
-  onError(callback) {
-    return this.on(CHANNEL_EVENTS.error, (reason) => callback(reason));
-  }
-  /**
-   * Subscribes on channel events
-   *
-   * Subscription returns a ref counter, which can be used later to
-   * unsubscribe the exact event listener
-   *
-   * @example
-   * const ref1 = channel.on("event", do_stuff)
-   * const ref2 = channel.on("event", do_other_stuff)
-   * channel.off("event", ref1)
-   * // Since unsubscription, do_stuff won't fire,
-   * // while do_other_stuff will keep firing on the "event"
-   *
-   * @param {string} event
-   * @param {ChannelBindingCallback} callback
-   * @returns {number} ref
-   */
-  on(event, callback) {
-    let ref = this.bindingRef++;
-    this.bindings.push({ event, ref, callback });
-    return ref;
-  }
-  /**
-   * Unsubscribes off of channel events
-   *
-   * Use the ref returned from a channel.on() to unsubscribe one
-   * handler, or pass nothing for the ref to unsubscribe all
-   * handlers for the given event.
-   *
-   * @example
-   * // Unsubscribe the do_stuff handler
-   * const ref1 = channel.on("event", do_stuff)
-   * channel.off("event", ref1)
-   *
-   * // Unsubscribe all handlers from event
-   * channel.off("event")
-   *
-   * @param {string} event
-   * @param {number} [ref]
-   */
-  off(event, ref) {
-    this.bindings = this.bindings.filter((bind) => {
-      return !(bind.event === event && (typeof ref === "undefined" || ref === bind.ref));
-    });
-  }
-  /**
-   * @private
-   */
-  canPush() {
-    return this.socket.isConnected() && this.isJoined();
-  }
-  /**
-   * Sends a message `event` to phoenix with the payload `payload`.
-   * Phoenix receives this in the `handle_in(event, payload, socket)`
-   * function. if phoenix replies or it times out (default 10000ms),
-   * then optionally the reply can be received.
-   *
-   * @example
-   * channel.push("event")
-   *   .receive("ok", payload => console.log("phoenix replied:", payload))
-   *   .receive("error", err => console.log("phoenix errored", err))
-   *   .receive("timeout", () => console.log("timed out pushing"))
-   * @param {string} event
-   * @param {Object} payload
-   * @param {number} [timeout]
-   * @returns {Push}
-   */
-  push(event, payload, timeout = this.timeout) {
-    payload = payload || {};
-    if (!this.joinedOnce) {
-      throw new Error(`tried to push '${event}' to '${this.topic}' before joining. Use channel.join() before pushing events`);
-    }
-    let pushEvent = new Push(this, event, function() {
-      return payload;
-    }, timeout);
-    if (this.canPush()) {
-      pushEvent.send();
-    } else {
-      pushEvent.startTimeout();
-      this.pushBuffer.push(pushEvent);
-    }
-    return pushEvent;
-  }
-  /** Leaves the channel
-   *
-   * Unsubscribes from server events, and
-   * instructs channel to terminate on server
-   *
-   * Triggers onClose() hooks
-   *
-   * To receive leave acknowledgements, use the `receive`
-   * hook to bind to the server ack, ie:
-   *
-   * @example
-   * channel.leave().receive("ok", () => alert("left!") )
-   *
-   * @param {number} timeout
-   * @returns {Push}
-   */
-  leave(timeout = this.timeout) {
-    this.rejoinTimer.reset();
-    this.joinPush.cancelTimeout();
-    this.state = CHANNEL_STATES.leaving;
-    let onClose = () => {
-      if (this.socket.hasLogger()) this.socket.log("channel", `leave ${this.topic}`);
-      this.trigger(CHANNEL_EVENTS.close, "leave");
-    };
-    let leavePush = new Push(this, CHANNEL_EVENTS.leave, closure({}), timeout);
-    leavePush.receive("ok", () => onClose()).receive("timeout", () => onClose());
-    leavePush.send();
-    if (!this.canPush()) {
-      leavePush.trigger("ok", {});
-    }
-    return leavePush;
-  }
-  /**
-   * Overridable message hook
-   *
-   * Receives all events for specialized message handling
-   * before dispatching to the channel callbacks.
-   *
-   * Must return the payload, modified or unmodified
-   * @type{ChannelOnMessage}
-   */
-  onMessage(_event, payload, _ref) {
-    return payload;
-  }
-  /**
-   * Overridable filter hook
-   *
-   * If this function returns `true`, `binding`'s callback will be called.
-   *
-   * @type{ChannelFilterBindings}
-   */
-  filterBindings(_binding, _payload, _ref) {
-    return true;
-  }
-  isMember(topic, event, payload, joinRef) {
-    if (this.topic !== topic) {
-      return false;
-    }
-    if (joinRef && joinRef !== this.joinRef()) {
-      if (this.socket.hasLogger()) this.socket.log("channel", "dropping outdated message", { topic, event, payload, joinRef });
-      return false;
-    } else {
-      return true;
-    }
-  }
-  joinRef() {
-    return this.joinPush.ref;
-  }
-  /**
-   * @private
-   */
-  rejoin(timeout = this.timeout) {
-    if (this.isLeaving()) {
-      return;
-    }
-    this.socket.leaveOpenTopic(this.topic);
-    this.state = CHANNEL_STATES.joining;
-    this.joinPush.resend(timeout);
-  }
-  /**
-   * @param {string} event
-   * @param {unknown} [payload]
-   * @param {?string} [ref]
-   * @param {?string} [joinRef]
-   */
-  trigger(event, payload, ref, joinRef) {
-    let handledPayload = this.onMessage(event, payload, ref, joinRef);
-    if (payload && !handledPayload) {
-      throw new Error("channel onMessage callbacks must return the payload, modified or unmodified");
-    }
-    let eventBindings = this.bindings.filter((bind) => bind.event === event && this.filterBindings(bind, payload, ref));
-    for (let i = 0; i < eventBindings.length; i++) {
-      let bind = eventBindings[i];
-      bind.callback(handledPayload, ref, joinRef || this.joinRef());
-    }
-  }
-  /**
-  * @param {string} ref
-  */
-  replyEventName(ref) {
-    return `chan_reply_${ref}`;
-  }
-  isClosed() {
-    return this.state === CHANNEL_STATES.closed;
-  }
-  isErrored() {
-    return this.state === CHANNEL_STATES.errored;
-  }
-  isJoined() {
-    return this.state === CHANNEL_STATES.joined;
-  }
-  isJoining() {
-    return this.state === CHANNEL_STATES.joining;
-  }
-  isLeaving() {
-    return this.state === CHANNEL_STATES.leaving;
-  }
-};
-
-// js/phoenix/ajax.js
-var Ajax = class {
-  static request(method, endPoint, headers, body, timeout, ontimeout, callback) {
-    if (global.XDomainRequest) {
-      let req = new global.XDomainRequest();
-      return this.xdomainRequest(req, method, endPoint, body, timeout, ontimeout, callback);
-    } else if (global.XMLHttpRequest) {
-      let req = new global.XMLHttpRequest();
-      return this.xhrRequest(req, method, endPoint, headers, body, timeout, ontimeout, callback);
-    } else if (global.fetch && global.AbortController) {
-      return this.fetchRequest(method, endPoint, headers, body, timeout, ontimeout, callback);
-    } else {
-      throw new Error("No suitable XMLHttpRequest implementation found");
-    }
-  }
-  static fetchRequest(method, endPoint, headers, body, timeout, ontimeout, callback) {
-    let options = {
-      method,
-      headers,
-      body
-    };
-    let controller = null;
-    if (timeout) {
-      controller = new AbortController();
-      const _timeoutId = setTimeout(() => controller.abort(), timeout);
-      options.signal = controller.signal;
-    }
-    global.fetch(endPoint, options).then((response) => response.text()).then((data) => this.parseJSON(data)).then((data) => callback && callback(data)).catch((err) => {
-      if (err.name === "AbortError" && ontimeout) {
-        ontimeout();
-      } else {
-        callback && callback(null);
-      }
-    });
-    return controller;
-  }
-  static xdomainRequest(req, method, endPoint, body, timeout, ontimeout, callback) {
-    req.timeout = timeout;
-    req.open(method, endPoint);
-    req.onload = () => {
-      let response = this.parseJSON(req.responseText);
-      callback && callback(response);
-    };
-    if (ontimeout) {
-      req.ontimeout = ontimeout;
-    }
-    req.onprogress = () => {
-    };
-    req.send(body);
-    return req;
-  }
-  static xhrRequest(req, method, endPoint, headers, body, timeout, ontimeout, callback) {
-    req.open(method, endPoint, true);
-    req.timeout = timeout;
-    for (let [key, value] of Object.entries(headers)) {
-      req.setRequestHeader(key, value);
-    }
-    req.onerror = () => callback && callback(null);
-    req.onreadystatechange = () => {
-      if (req.readyState === XHR_STATES.complete && callback) {
-        let response = this.parseJSON(req.responseText);
-        callback(response);
-      }
-    };
-    if (ontimeout) {
-      req.ontimeout = ontimeout;
-    }
-    req.send(body);
-    return req;
-  }
-  static parseJSON(resp) {
-    if (!resp || resp === "") {
-      return null;
-    }
-    try {
-      return JSON.parse(resp);
-    } catch {
-      console && console.log("failed to parse JSON response", resp);
-      return null;
-    }
-  }
-  static serialize(obj, parentKey) {
-    let queryStr = [];
-    for (var key in obj) {
-      if (!Object.prototype.hasOwnProperty.call(obj, key)) {
-        continue;
-      }
-      let paramKey = parentKey ? `${parentKey}[${key}]` : key;
-      let paramVal = obj[key];
-      if (typeof paramVal === "object") {
-        queryStr.push(this.serialize(paramVal, paramKey));
-      } else {
-        queryStr.push(encodeURIComponent(paramKey) + "=" + encodeURIComponent(paramVal));
-      }
-    }
-    return queryStr.join("&");
-  }
-  static appendParams(url, params) {
-    if (Object.keys(params).length === 0) {
-      return url;
-    }
-    let prefix = url.match(/\?/) ? "&" : "?";
-    return `${url}${prefix}${this.serialize(params)}`;
-  }
-};
-
-// js/phoenix/longpoll.js
-var arrayBufferToBase64 = (buffer) => {
-  let binary = "";
-  let bytes = new Uint8Array(buffer);
-  let len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-};
-var LongPoll = class {
-  constructor(endPoint, protocols) {
-    if (protocols && protocols.length === 2 && protocols[1].startsWith(AUTH_TOKEN_PREFIX)) {
-      this.authToken = atob(protocols[1].slice(AUTH_TOKEN_PREFIX.length));
-    }
-    this.endPoint = null;
-    this.token = null;
-    this.skipHeartbeat = true;
-    this.reqs = /* @__PURE__ */ new Set();
-    this.awaitingBatchAck = false;
-    this.currentBatch = null;
-    this.currentBatchTimer = null;
-    this.batchBuffer = [];
-    this.onopen = function() {
-    };
-    this.onerror = function() {
-    };
-    this.onmessage = function() {
-    };
-    this.onclose = function() {
-    };
-    this.pollEndpoint = this.normalizeEndpoint(endPoint);
-    this.readyState = SOCKET_STATES.connecting;
-    setTimeout(() => this.poll(), 0);
-  }
-  normalizeEndpoint(endPoint) {
-    return endPoint.replace("ws://", "http://").replace("wss://", "https://").replace(new RegExp("(.*)/" + TRANSPORTS.websocket), "$1/" + TRANSPORTS.longpoll);
-  }
-  endpointURL() {
-    return Ajax.appendParams(this.pollEndpoint, { token: this.token });
-  }
-  closeAndRetry(code, reason, wasClean) {
-    this.close(code, reason, wasClean);
-    this.readyState = SOCKET_STATES.connecting;
-  }
-  ontimeout() {
-    this.onerror("timeout");
-    this.closeAndRetry(1005, "timeout", false);
-  }
-  isActive() {
-    return this.readyState === SOCKET_STATES.open || this.readyState === SOCKET_STATES.connecting;
-  }
-  poll() {
-    const headers = { "Accept": "application/json" };
-    if (this.authToken) {
-      headers["X-Phoenix-AuthToken"] = this.authToken;
-    }
-    this.ajax("GET", headers, null, () => this.ontimeout(), (resp) => {
-      if (resp) {
-        var { status, token, messages } = resp;
-        if (status === 410 && this.token !== null) {
-          this.onerror(410);
-          this.closeAndRetry(3410, "session_gone", false);
-          return;
-        }
-        this.token = token;
-      } else {
-        status = 0;
-      }
-      switch (status) {
-        case 200:
-          messages.forEach((msg) => {
-            setTimeout(() => this.onmessage({ data: msg }), 0);
-          });
-          this.poll();
-          break;
-        case 204:
-          this.poll();
-          break;
-        case 410:
-          this.readyState = SOCKET_STATES.open;
-          this.onopen({});
-          this.poll();
-          break;
-        case 403:
-          this.onerror(403);
-          this.close(1008, "forbidden", false);
-          break;
-        case 0:
-        case 500:
-          this.onerror(500);
-          this.closeAndRetry(1011, "internal server error", 500);
-          break;
-        default:
-          throw new Error(`unhandled poll status ${status}`);
-      }
-    });
-  }
-  // we collect all pushes within the current event loop by
-  // setTimeout 0, which optimizes back-to-back procedural
-  // pushes against an empty buffer
-  send(body) {
-    if (typeof body !== "string") {
-      body = arrayBufferToBase64(body);
-    }
-    if (this.currentBatch) {
-      this.currentBatch.push(body);
-    } else if (this.awaitingBatchAck) {
-      this.batchBuffer.push(body);
-    } else {
-      this.currentBatch = [body];
-      this.currentBatchTimer = setTimeout(() => {
-        this.batchSend(this.currentBatch);
-        this.currentBatch = null;
-      }, 0);
-    }
-  }
-  batchSend(messages) {
-    this.awaitingBatchAck = true;
-    this.ajax("POST", { "Content-Type": "application/x-ndjson" }, messages.join("\n"), () => this.onerror("timeout"), (resp) => {
-      this.awaitingBatchAck = false;
-      if (!resp || resp.status !== 200) {
-        this.onerror(resp && resp.status);
-        this.closeAndRetry(1011, "internal server error", false);
-      } else if (this.batchBuffer.length > 0) {
-        this.batchSend(this.batchBuffer);
-        this.batchBuffer = [];
-      }
-    });
-  }
-  close(code, reason, wasClean) {
-    for (let req of this.reqs) {
-      req.abort();
-    }
-    this.readyState = SOCKET_STATES.closed;
-    let opts = Object.assign({ code: 1e3, reason: void 0, wasClean: true }, { code, reason, wasClean });
-    this.batchBuffer = [];
-    clearTimeout(this.currentBatchTimer);
-    this.currentBatchTimer = null;
-    if (typeof CloseEvent !== "undefined") {
-      this.onclose(new CloseEvent("close", opts));
-    } else {
-      this.onclose(opts);
-    }
-  }
-  ajax(method, headers, body, onCallerTimeout, callback) {
-    let req;
-    let ontimeout = () => {
-      this.reqs.delete(req);
-      onCallerTimeout();
-    };
-    req = Ajax.request(method, this.endpointURL(), headers, body, this.timeout, ontimeout, (resp) => {
-      this.reqs.delete(req);
-      if (this.isActive()) {
-        callback(resp);
-      }
-    });
-    this.reqs.add(req);
-  }
-};
-
-// js/phoenix/presence.js
-var Presence = class _Presence {
-  /**
-   * Initializes the Presence
-   * @param {Channel} channel - The Channel
-   * @param {PresenceOptions} [opts] - The options, for example `{events: {state: "state", diff: "diff"}}`
-   */
-  constructor(channel, opts = {}) {
-    let events = opts.events || /** @type {PresenceEvents} */
-    { state: "presence_state", diff: "presence_diff" };
-    this.state = {};
-    this.pendingDiffs = [];
-    this.channel = channel;
-    this.joinRef = null;
-    this.caller = {
-      onJoin: function() {
-      },
-      onLeave: function() {
-      },
-      onSync: function() {
-      }
-    };
-    this.channel.on(events.state, (newState) => {
-      let { onJoin, onLeave, onSync } = this.caller;
-      this.joinRef = this.channel.joinRef();
-      this.state = _Presence.syncState(this.state, newState, onJoin, onLeave);
-      this.pendingDiffs.forEach((diff) => {
-        this.state = _Presence.syncDiff(this.state, diff, onJoin, onLeave);
-      });
-      this.pendingDiffs = [];
-      onSync();
-    });
-    this.channel.on(events.diff, (diff) => {
-      let { onJoin, onLeave, onSync } = this.caller;
-      if (this.inPendingSyncState()) {
-        this.pendingDiffs.push(diff);
-      } else {
-        this.state = _Presence.syncDiff(this.state, diff, onJoin, onLeave);
-        onSync();
-      }
-    });
-  }
-  /**
-   * @param {PresenceOnJoin} callback
-   */
-  onJoin(callback) {
-    this.caller.onJoin = callback;
-  }
-  /**
-   * @param {PresenceOnLeave} callback
-   */
-  onLeave(callback) {
-    this.caller.onLeave = callback;
-  }
-  /**
-   * @param {PresenceOnSync} callback
-   */
-  onSync(callback) {
-    this.caller.onSync = callback;
-  }
-  /**
-   * Returns the array of presences, with selected metadata.
-   *
-   * @template [T=PresenceState]
-   * @param {((key: string, obj: PresenceState) => T)} [by]
-   *
-   * @returns {T[]}
-   */
-  list(by) {
-    return _Presence.list(this.state, by);
-  }
-  inPendingSyncState() {
-    return !this.joinRef || this.joinRef !== this.channel.joinRef();
-  }
-  // lower-level public static API
-  /**
-   * Used to sync the list of presences on the server
-   * with the client's state. An optional `onJoin` and `onLeave` callback can
-   * be provided to react to changes in the client's local presences across
-   * disconnects and reconnects with the server.
-   *
-   * @param {Record<string, PresenceState>} currentState
-   * @param {Record<string, PresenceState>} newState
-   * @param {PresenceOnJoin} onJoin
-   * @param {PresenceOnLeave} onLeave
-   *
-   * @returns {Record<string, PresenceState>}
-   */
-  static syncState(currentState, newState, onJoin, onLeave) {
-    let state = this.clone(currentState);
-    let joins = {};
-    let leaves = {};
-    this.map(state, (key, presence) => {
-      if (!newState[key]) {
-        leaves[key] = presence;
-      }
-    });
-    this.map(newState, (key, newPresence) => {
-      let currentPresence = state[key];
-      if (currentPresence) {
-        let newRefs = newPresence.metas.map((m) => m.phx_ref);
-        let curRefs = currentPresence.metas.map((m) => m.phx_ref);
-        let joinedMetas = newPresence.metas.filter((m) => curRefs.indexOf(m.phx_ref) < 0);
-        let leftMetas = currentPresence.metas.filter((m) => newRefs.indexOf(m.phx_ref) < 0);
-        if (joinedMetas.length > 0) {
-          joins[key] = newPresence;
-          joins[key].metas = joinedMetas;
-        }
-        if (leftMetas.length > 0) {
-          leaves[key] = this.clone(currentPresence);
-          leaves[key].metas = leftMetas;
-        }
-      } else {
-        joins[key] = newPresence;
-      }
-    });
-    return this.syncDiff(state, { joins, leaves }, onJoin, onLeave);
-  }
-  /**
-   *
-   * Used to sync a diff of presence join and leave
-   * events from the server, as they happen. Like `syncState`, `syncDiff`
-   * accepts optional `onJoin` and `onLeave` callbacks to react to a user
-   * joining or leaving from a device.
-   *
-   * @param {Record<string, PresenceState>} state
-   * @param {PresenceDiff} diff
-   * @param {PresenceOnJoin} onJoin
-   * @param {PresenceOnLeave} onLeave
-   *
-   * @returns {Record<string, PresenceState>}
-   */
-  static syncDiff(state, diff, onJoin, onLeave) {
-    let { joins, leaves } = this.clone(diff);
-    if (!onJoin) {
-      onJoin = function() {
-      };
-    }
-    if (!onLeave) {
-      onLeave = function() {
-      };
-    }
-    this.map(joins, (key, newPresence) => {
-      let currentPresence = state[key];
-      state[key] = this.clone(newPresence);
-      if (currentPresence) {
-        let joinedRefs = state[key].metas.map((m) => m.phx_ref);
-        let curMetas = currentPresence.metas.filter((m) => joinedRefs.indexOf(m.phx_ref) < 0);
-        state[key].metas.unshift(...curMetas);
-      }
-      onJoin(key, currentPresence, newPresence);
-    });
-    this.map(leaves, (key, leftPresence) => {
-      let currentPresence = state[key];
-      if (!currentPresence) {
-        return;
-      }
-      let refsToRemove = leftPresence.metas.map((m) => m.phx_ref);
-      currentPresence.metas = currentPresence.metas.filter((p) => {
-        return refsToRemove.indexOf(p.phx_ref) < 0;
-      });
-      onLeave(key, currentPresence, leftPresence);
-      if (currentPresence.metas.length === 0) {
-        delete state[key];
-      }
-    });
-    return state;
-  }
-  /**
-   * Returns the array of presences, with selected metadata.
-   *
-   * @template [T=PresenceState]
-   * @param {Record<string, PresenceState>} presences
-   * @param {((key: string, obj: PresenceState) => T)} [chooser]
-   *
-   * @returns {T[]}
-   */
-  static list(presences, chooser) {
-    if (!chooser) {
-      chooser = function(key, pres) {
-        return pres;
-      };
-    }
-    return this.map(presences, (key, presence) => {
-      return chooser(key, presence);
-    });
-  }
-  // private
-  /**
-  * @template T
-  * @param {Record<string, PresenceState>} obj
-  * @param {(key: string, obj: PresenceState) => T} func
-  */
-  static map(obj, func) {
-    return Object.getOwnPropertyNames(obj).map((key) => func(key, obj[key]));
-  }
-  /**
-  * @template T
-  * @param {T} obj
-  * @returns {T}
-  */
-  static clone(obj) {
-    return JSON.parse(JSON.stringify(obj));
-  }
-};
-
-// js/phoenix/serializer.js
-var serializer_default = {
-  HEADER_LENGTH: 1,
-  META_LENGTH: 4,
-  KINDS: { push: 0, reply: 1, broadcast: 2 },
-  /**
-  * @template T
-  * @param {Message<Record<string, any>>} msg
-  * @param {(msg: ArrayBuffer | string) => T} callback
-  * @returns {T}
-  */
-  encode(msg, callback) {
-    if (msg.payload.constructor === ArrayBuffer) {
-      return callback(this.binaryEncode(msg));
-    } else {
-      let payload = [msg.join_ref, msg.ref, msg.topic, msg.event, msg.payload];
-      return callback(JSON.stringify(payload));
-    }
-  },
-  /**
-  * @template T
-  * @param {ArrayBuffer | string} rawPayload
-  * @param {(msg: Message<unknown>) => T} callback
-  * @returns {T}
-  */
-  decode(rawPayload, callback) {
-    if (rawPayload.constructor === ArrayBuffer) {
-      return callback(this.binaryDecode(rawPayload));
-    } else {
-      let [join_ref, ref, topic, event, payload] = JSON.parse(rawPayload);
-      return callback({ join_ref, ref, topic, event, payload });
-    }
-  },
-  /** @private */
-  binaryEncode(message) {
-    let { join_ref, ref, event, topic, payload } = message;
-    let metaLength = this.META_LENGTH + join_ref.length + ref.length + topic.length + event.length;
-    let header = new ArrayBuffer(this.HEADER_LENGTH + metaLength);
-    let view = new DataView(header);
-    let offset = 0;
-    view.setUint8(offset++, this.KINDS.push);
-    view.setUint8(offset++, join_ref.length);
-    view.setUint8(offset++, ref.length);
-    view.setUint8(offset++, topic.length);
-    view.setUint8(offset++, event.length);
-    Array.from(join_ref, (char) => view.setUint8(offset++, char.charCodeAt(0)));
-    Array.from(ref, (char) => view.setUint8(offset++, char.charCodeAt(0)));
-    Array.from(topic, (char) => view.setUint8(offset++, char.charCodeAt(0)));
-    Array.from(event, (char) => view.setUint8(offset++, char.charCodeAt(0)));
-    var combined = new Uint8Array(header.byteLength + payload.byteLength);
-    combined.set(new Uint8Array(header), 0);
-    combined.set(new Uint8Array(payload), header.byteLength);
-    return combined.buffer;
-  },
-  /**
-  * @private
-  */
-  binaryDecode(buffer) {
-    let view = new DataView(buffer);
-    let kind = view.getUint8(0);
-    let decoder = new TextDecoder();
-    switch (kind) {
-      case this.KINDS.push:
-        return this.decodePush(buffer, view, decoder);
-      case this.KINDS.reply:
-        return this.decodeReply(buffer, view, decoder);
-      case this.KINDS.broadcast:
-        return this.decodeBroadcast(buffer, view, decoder);
-    }
-  },
-  /** @private */
-  decodePush(buffer, view, decoder) {
-    let joinRefSize = view.getUint8(1);
-    let topicSize = view.getUint8(2);
-    let eventSize = view.getUint8(3);
-    let offset = this.HEADER_LENGTH + this.META_LENGTH - 1;
-    let joinRef = decoder.decode(buffer.slice(offset, offset + joinRefSize));
-    offset = offset + joinRefSize;
-    let topic = decoder.decode(buffer.slice(offset, offset + topicSize));
-    offset = offset + topicSize;
-    let event = decoder.decode(buffer.slice(offset, offset + eventSize));
-    offset = offset + eventSize;
-    let data = buffer.slice(offset, buffer.byteLength);
-    return { join_ref: joinRef, ref: null, topic, event, payload: data };
-  },
-  /** @private */
-  decodeReply(buffer, view, decoder) {
-    let joinRefSize = view.getUint8(1);
-    let refSize = view.getUint8(2);
-    let topicSize = view.getUint8(3);
-    let eventSize = view.getUint8(4);
-    let offset = this.HEADER_LENGTH + this.META_LENGTH;
-    let joinRef = decoder.decode(buffer.slice(offset, offset + joinRefSize));
-    offset = offset + joinRefSize;
-    let ref = decoder.decode(buffer.slice(offset, offset + refSize));
-    offset = offset + refSize;
-    let topic = decoder.decode(buffer.slice(offset, offset + topicSize));
-    offset = offset + topicSize;
-    let event = decoder.decode(buffer.slice(offset, offset + eventSize));
-    offset = offset + eventSize;
-    let data = buffer.slice(offset, buffer.byteLength);
-    let payload = { status: event, response: data };
-    return { join_ref: joinRef, ref, topic, event: CHANNEL_EVENTS.reply, payload };
-  },
-  /** @private */
-  decodeBroadcast(buffer, view, decoder) {
-    let topicSize = view.getUint8(1);
-    let eventSize = view.getUint8(2);
-    let offset = this.HEADER_LENGTH + 2;
-    let topic = decoder.decode(buffer.slice(offset, offset + topicSize));
-    offset = offset + topicSize;
-    let event = decoder.decode(buffer.slice(offset, offset + eventSize));
-    offset = offset + eventSize;
-    let data = buffer.slice(offset, buffer.byteLength);
-    return { join_ref: null, ref: null, topic, event, payload: data };
-  }
-};
-
-// js/phoenix/socket.js
-var Socket = class {
-  /** Initializes the Socket *
-   *
-   * For IE8 support use an ES5-shim (https://github.com/es-shims/es5-shim)
-   *
-   * @constructor
-   * @param {string} endPoint - The string WebSocket endpoint, ie, `"ws://example.com/socket"`,
-   *                                               `"wss://example.com"`
-   *                                               `"/socket"` (inherited host & protocol)
-   * @param {SocketOptions} [opts] - Optional configuration
-   */
-  constructor(endPoint, opts = {}) {
-    this.stateChangeCallbacks = { open: [], close: [], error: [], message: [] };
-    this.channels = [];
-    this.sendBuffer = [];
-    this.ref = 0;
-    this.fallbackRef = null;
-    this.timeout = opts.timeout || DEFAULT_TIMEOUT;
-    this.transport = opts.transport || global.WebSocket || LongPoll;
-    this.conn = void 0;
-    this.primaryPassedHealthCheck = false;
-    this.longPollFallbackMs = opts.longPollFallbackMs;
-    this.fallbackTimer = null;
-    this.sessionStore = opts.sessionStorage || global && global.sessionStorage;
-    this.establishedConnections = 0;
-    this.defaultEncoder = serializer_default.encode.bind(serializer_default);
-    this.defaultDecoder = serializer_default.decode.bind(serializer_default);
-    this.closeWasClean = true;
-    this.disconnecting = false;
-    this.binaryType = opts.binaryType || "arraybuffer";
-    this.connectClock = 1;
-    this.pageHidden = false;
-    this.encode = void 0;
-    this.decode = void 0;
-    if (this.transport !== LongPoll) {
-      this.encode = opts.encode || this.defaultEncoder;
-      this.decode = opts.decode || this.defaultDecoder;
-    } else {
-      this.encode = this.defaultEncoder;
-      this.decode = this.defaultDecoder;
-    }
-    let awaitingConnectionOnPageShow = null;
-    if (phxWindow && phxWindow.addEventListener) {
-      phxWindow.addEventListener("pagehide", (_e) => {
-        if (this.conn) {
-          this.disconnect();
-          awaitingConnectionOnPageShow = this.connectClock;
-        }
-      });
-      phxWindow.addEventListener("pageshow", (_e) => {
-        if (awaitingConnectionOnPageShow === this.connectClock) {
-          awaitingConnectionOnPageShow = null;
-          this.connect();
-        }
-      });
-      phxWindow.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "hidden") {
-          this.pageHidden = true;
-        } else {
-          this.pageHidden = false;
-          if (!this.isConnected() && !this.closeWasClean) {
-            this.teardown(() => this.connect());
-          }
-        }
-      });
-    }
-    this.heartbeatIntervalMs = opts.heartbeatIntervalMs || 3e4;
-    this.autoSendHeartbeat = opts.autoSendHeartbeat ?? true;
-    this.heartbeatCallback = opts.heartbeatCallback ?? (() => {
-    });
-    this.rejoinAfterMs = (tries) => {
-      if (opts.rejoinAfterMs) {
-        return opts.rejoinAfterMs(tries);
-      } else {
-        return [1e3, 2e3, 5e3][tries - 1] || 1e4;
-      }
-    };
-    this.reconnectAfterMs = (tries) => {
-      if (opts.reconnectAfterMs) {
-        return opts.reconnectAfterMs(tries);
-      } else {
-        return [10, 50, 100, 150, 200, 250, 500, 1e3, 2e3][tries - 1] || 5e3;
-      }
-    };
-    this.logger = opts.logger || null;
-    if (!this.logger && opts.debug) {
-      this.logger = (kind, msg, data) => {
-        console.log(`${kind}: ${msg}`, data);
-      };
-    }
-    this.longpollerTimeout = opts.longpollerTimeout || 2e4;
-    this.params = closure(opts.params || {});
-    this.endPoint = `${endPoint}/${TRANSPORTS.websocket}`;
-    this.vsn = opts.vsn || DEFAULT_VSN;
-    this.heartbeatTimeoutTimer = null;
-    this.heartbeatTimer = null;
-    this.heartbeatSentAt = null;
-    this.pendingHeartbeatRef = null;
-    this.reconnectTimer = new Timer(() => {
-      if (this.pageHidden) {
-        this.log("Not reconnecting as page is hidden!");
-        this.teardown();
-        return;
-      }
-      this.teardown(async () => {
-        if (opts.beforeReconnect) await opts.beforeReconnect();
-        this.connect();
-      });
-    }, this.reconnectAfterMs);
-    this.authToken = opts.authToken;
-  }
-  /**
-   * Returns the LongPoll transport reference
-   */
-  getLongPollTransport() {
-    return LongPoll;
-  }
-  /**
-   * Disconnects and replaces the active transport
-   *
-   * @param {SocketTransport} newTransport - The new transport class to instantiate
-   *
-   */
-  replaceTransport(newTransport) {
-    this.connectClock++;
-    this.closeWasClean = true;
-    clearTimeout(this.fallbackTimer);
-    this.reconnectTimer.reset();
-    if (this.conn) {
-      this.conn.close();
-      this.conn = null;
-    }
-    this.transport = newTransport;
-  }
-  /**
-   * Returns the socket protocol
-   *
-   * @returns {"wss" | "ws"}
-   */
-  protocol() {
-    return location.protocol.match(/^https/) ? "wss" : "ws";
-  }
-  /**
-   * The fully qualified socket url
-   *
-   * @returns {string}
-   */
-  endPointURL() {
-    let uri = Ajax.appendParams(
-      Ajax.appendParams(this.endPoint, this.params()),
-      { vsn: this.vsn }
-    );
-    if (uri.charAt(0) !== "/") {
-      return uri;
-    }
-    if (uri.charAt(1) === "/") {
-      return `${this.protocol()}:${uri}`;
-    }
-    return `${this.protocol()}://${location.host}${uri}`;
-  }
-  /**
-   * Disconnects the socket
-   *
-   * See https://developer.mozilla.org/en-US/docs/Web/API/CloseEvent#Status_codes for valid status codes.
-   *
-   * @param {() => void} [callback] - Optional callback which is called after socket is disconnected.
-   * @param {number} [code] - A status code for disconnection (Optional).
-   * @param {string} [reason] - A textual description of the reason to disconnect. (Optional)
-   */
-  disconnect(callback, code, reason) {
-    this.connectClock++;
-    this.disconnecting = true;
-    this.closeWasClean = true;
-    clearTimeout(this.fallbackTimer);
-    this.reconnectTimer.reset();
-    this.teardown(() => {
-      this.disconnecting = false;
-      callback && callback();
-    }, code, reason);
-  }
-  /**
-   * @param {Params} [params] - [DEPRECATED] The params to send when connecting, for example `{user_id: userToken}`
-   *
-   * Passing params to connect is deprecated; pass them in the Socket constructor instead:
-   * `new Socket("/socket", {params: {user_id: userToken}})`.
-   */
-  connect(params) {
-    if (params) {
-      console && console.log("passing params to connect is deprecated. Instead pass :params to the Socket constructor");
-      this.params = closure(params);
-    }
-    if (this.conn && !this.disconnecting) {
-      return;
-    }
-    if (this.longPollFallbackMs && this.transport !== LongPoll) {
-      this.connectWithFallback(LongPoll, this.longPollFallbackMs);
-    } else {
-      this.transportConnect();
-    }
-  }
-  /**
-   * Logs the message. Override `this.logger` for specialized logging. noops by default
-   * @param {string} kind
-   * @param {string} msg
-   * @param {Object} data
-   */
-  log(kind, msg, data) {
-    this.logger && this.logger(kind, msg, data);
-  }
-  /**
-   * Returns true if a logger has been set on this socket.
-   */
-  hasLogger() {
-    return this.logger !== null;
-  }
-  /**
-   * Registers callbacks for connection open events
-   *
-   * @example socket.onOpen(function(){ console.info("the socket was opened") })
-   *
-   * @param {SocketOnOpen} callback
-   */
-  onOpen(callback) {
-    let ref = this.makeRef();
-    this.stateChangeCallbacks.open.push([ref, callback]);
-    return ref;
-  }
-  /**
-   * Registers callbacks for connection close events
-   * @param {SocketOnClose} callback
-   * @returns {string}
-   */
-  onClose(callback) {
-    let ref = this.makeRef();
-    this.stateChangeCallbacks.close.push([ref, callback]);
-    return ref;
-  }
-  /**
-   * Registers callbacks for connection error events
-   *
-   * @example socket.onError(function(error){ alert("An error occurred") })
-   *
-   * @param {SocketOnError} callback
-   * @returns {string}
-   */
-  onError(callback) {
-    let ref = this.makeRef();
-    this.stateChangeCallbacks.error.push([ref, callback]);
-    return ref;
-  }
-  /**
-   * Registers callbacks for connection message events
-   * @param {SocketOnMessage} callback
-   * @returns {string}
-   */
-  onMessage(callback) {
-    let ref = this.makeRef();
-    this.stateChangeCallbacks.message.push([ref, callback]);
-    return ref;
-  }
-  /**
-   * Sets a callback that receives lifecycle events for internal heartbeat messages.
-   * Useful for instrumenting connection health (e.g. sent/ok/timeout/disconnected).
-   * @param {HeartbeatCallback} callback
-   */
-  onHeartbeat(callback) {
-    this.heartbeatCallback = callback;
-  }
-  /**
-   * Pings the server and invokes the callback with the RTT in milliseconds
-   * @param {(timeDelta: number) => void} callback
-   *
-   * Returns true if the ping was pushed or false if unable to be pushed.
-   */
-  ping(callback) {
-    if (!this.isConnected()) {
-      return false;
-    }
-    let ref = this.makeRef();
-    let startTime = Date.now();
-    this.push({ topic: "phoenix", event: "heartbeat", payload: {}, ref });
-    let onMsgRef = this.onMessage((msg) => {
-      if (msg.ref === ref) {
-        this.off([onMsgRef]);
-        callback(Date.now() - startTime);
-      }
-    });
-    return true;
-  }
-  /**
-   * @private
-   *
-   * @param {Function}
-   */
-  transportName(transport) {
-    switch (transport) {
-      case LongPoll:
-        return "LongPoll";
-      default:
-        return transport.name;
-    }
-  }
-  /**
-   * @private
-   */
-  transportConnect() {
-    this.connectClock++;
-    this.closeWasClean = false;
-    let protocols = void 0;
-    if (this.authToken) {
-      protocols = ["phoenix", `${AUTH_TOKEN_PREFIX}${btoa(this.authToken).replace(/=/g, "")}`];
-    }
-    this.conn = new this.transport(this.endPointURL(), protocols);
-    this.conn.binaryType = this.binaryType;
-    this.conn.timeout = this.longpollerTimeout;
-    this.conn.onopen = () => this.onConnOpen();
-    this.conn.onerror = (error) => this.onConnError(error);
-    this.conn.onmessage = (event) => this.onConnMessage(event);
-    this.conn.onclose = (event) => this.onConnClose(event);
-  }
-  getSession(key) {
-    return this.sessionStore && this.sessionStore.getItem(key);
-  }
-  storeSession(key, val) {
-    this.sessionStore && this.sessionStore.setItem(key, val);
-  }
-  connectWithFallback(fallbackTransport, fallbackThreshold = 2500) {
-    clearTimeout(this.fallbackTimer);
-    let established = false;
-    let primaryTransport = true;
-    let openRef, errorRef;
-    let fallbackTransportName = this.transportName(fallbackTransport);
-    let fallback = (reason) => {
-      this.log("transport", `falling back to ${fallbackTransportName}...`, reason);
-      this.off([openRef, errorRef]);
-      primaryTransport = false;
-      this.replaceTransport(fallbackTransport);
-      this.transportConnect();
-    };
-    if (this.getSession(`phx:fallback:${fallbackTransportName}`)) {
-      return fallback("memorized");
-    }
-    this.fallbackTimer = setTimeout(fallback, fallbackThreshold);
-    errorRef = this.onError((reason) => {
-      this.log("transport", "error", reason);
-      if (primaryTransport && !established) {
-        clearTimeout(this.fallbackTimer);
-        fallback(reason);
-      }
-    });
-    if (this.fallbackRef) {
-      this.off([this.fallbackRef]);
-    }
-    this.fallbackRef = this.onOpen(() => {
-      established = true;
-      if (!primaryTransport) {
-        let fallbackTransportName2 = this.transportName(fallbackTransport);
-        if (!this.primaryPassedHealthCheck) {
-          this.storeSession(`phx:fallback:${fallbackTransportName2}`, "true");
-        }
-        return this.log("transport", `established ${fallbackTransportName2} fallback`);
-      }
-      clearTimeout(this.fallbackTimer);
-      this.fallbackTimer = setTimeout(fallback, fallbackThreshold);
-      this.ping((rtt) => {
-        this.log("transport", "connected to primary after", rtt);
-        this.primaryPassedHealthCheck = true;
-        clearTimeout(this.fallbackTimer);
-      });
-    });
-    this.transportConnect();
-  }
-  clearHeartbeats() {
-    clearTimeout(this.heartbeatTimer);
-    clearTimeout(this.heartbeatTimeoutTimer);
-  }
-  onConnOpen() {
-    if (this.hasLogger()) this.log("transport", `connected to ${this.endPointURL()}`);
-    this.closeWasClean = false;
-    this.disconnecting = false;
-    this.establishedConnections++;
-    this.flushSendBuffer();
-    this.reconnectTimer.reset();
-    if (this.autoSendHeartbeat) {
-      this.resetHeartbeat();
-    }
-    this.triggerStateCallbacks("open");
-  }
-  /**
-   * @private
-   */
-  heartbeatTimeout() {
-    if (this.pendingHeartbeatRef) {
-      this.pendingHeartbeatRef = null;
-      this.heartbeatSentAt = null;
-      if (this.hasLogger()) {
-        this.log("transport", "heartbeat timeout. Attempting to re-establish connection");
-      }
-      try {
-        this.heartbeatCallback("timeout");
-      } catch (e) {
-        this.log("error", "error in heartbeat callback", e);
-      }
-      this.triggerChanError();
-      this.closeWasClean = false;
-      this.teardown(() => this.reconnectTimer.scheduleTimeout(), WS_CLOSE_NORMAL, "heartbeat timeout");
-    }
-  }
-  resetHeartbeat() {
-    if (this.conn && this.conn.skipHeartbeat) {
-      return;
-    }
-    this.pendingHeartbeatRef = null;
-    this.clearHeartbeats();
-    this.heartbeatTimer = setTimeout(() => this.sendHeartbeat(), this.heartbeatIntervalMs);
-  }
-  teardown(callback, code, reason) {
-    if (!this.conn) {
-      return callback && callback();
-    }
-    const connToClose = this.conn;
-    this.waitForBufferDone(connToClose, () => {
-      if (code) {
-        connToClose.close(code, reason || "");
-      } else {
-        connToClose.close();
-      }
-      this.waitForSocketClosed(connToClose, () => {
-        if (this.conn === connToClose) {
-          this.conn.onopen = function() {
-          };
-          this.conn.onerror = function() {
-          };
-          this.conn.onmessage = function() {
-          };
-          this.conn.onclose = function() {
-          };
-          this.conn = null;
-        }
-        callback && callback();
-      });
-    });
-  }
-  waitForBufferDone(conn, callback, tries = 1) {
-    if (tries === 5 || !conn.bufferedAmount) {
-      callback();
-      return;
-    }
-    setTimeout(() => {
-      this.waitForBufferDone(conn, callback, tries + 1);
-    }, 150 * tries);
-  }
-  waitForSocketClosed(conn, callback, tries = 1) {
-    if (tries === 5 || conn.readyState === SOCKET_STATES.closed) {
-      callback();
-      return;
-    }
-    setTimeout(() => {
-      this.waitForSocketClosed(conn, callback, tries + 1);
-    }, 150 * tries);
-  }
-  /**
-  * @param {CloseEvent} event
-  */
-  onConnClose(event) {
-    if (this.conn) this.conn.onclose = () => {
-    };
-    if (this.hasLogger()) this.log("transport", "close", event);
-    this.triggerChanError();
-    this.clearHeartbeats();
-    if (!this.closeWasClean) {
-      this.reconnectTimer.scheduleTimeout();
-    }
-    this.triggerStateCallbacks("close", event);
-  }
-  /**
-   * @private
-   * @param {Event} error
-   */
-  onConnError(error) {
-    if (this.hasLogger()) this.log("transport", error);
-    let transportBefore = this.transport;
-    let establishedBefore = this.establishedConnections;
-    this.triggerStateCallbacks("error", error, transportBefore, establishedBefore);
-    if (transportBefore === this.transport || establishedBefore > 0) {
-      this.triggerChanError();
-    }
-  }
-  /**
-   * @private
-   */
-  triggerChanError() {
-    this.channels.forEach((channel) => {
-      if (!(channel.isErrored() || channel.isLeaving() || channel.isClosed())) {
-        channel.trigger(CHANNEL_EVENTS.error);
-      }
-    });
-  }
-  /**
-   * @returns {string}
-   */
-  connectionState() {
-    switch (this.conn && this.conn.readyState) {
-      case SOCKET_STATES.connecting:
-        return "connecting";
-      case SOCKET_STATES.open:
-        return "open";
-      case SOCKET_STATES.closing:
-        return "closing";
-      default:
-        return "closed";
-    }
-  }
-  /**
-   * @returns {boolean}
-   */
-  isConnected() {
-    return this.connectionState() === "open";
-  }
-  /**
-   *
-   * @param {Channel} channel
-   */
-  remove(channel) {
-    this.off(channel.stateChangeRefs);
-    this.channels = this.channels.filter((c) => c !== channel);
-  }
-  /**
-   * Removes `onOpen`, `onClose`, `onError,` and `onMessage` registrations.
-   *
-   * @param {string[]} refs - list of refs returned by calls to
-   *                 `onOpen`, `onClose`, `onError,` and `onMessage`
-   */
-  off(refs) {
-    for (let key in this.stateChangeCallbacks) {
-      this.stateChangeCallbacks[key] = this.stateChangeCallbacks[key].filter(([ref]) => {
-        return refs.indexOf(ref) === -1;
-      });
-    }
-  }
-  /**
-   * Initiates a new channel for the given topic
-   *
-   * @param {string} topic
-   * @param {Params | (() => Params)} [chanParams]- Parameters for the channel
-   * @returns {Channel}
-   */
-  channel(topic, chanParams = {}) {
-    let chan = new Channel(topic, chanParams, this);
-    this.channels.push(chan);
-    return chan;
-  }
-  /**
-   * @param {Message<Record<string, any>>} data
-   */
-  push(data) {
-    if (this.hasLogger()) {
-      let { topic, event, payload, ref, join_ref } = data;
-      this.log("push", `${topic} ${event} (${join_ref}, ${ref})`, payload);
-    }
-    if (this.isConnected()) {
-      this.encode(data, (result) => this.conn.send(result));
-    } else {
-      this.sendBuffer.push(() => this.encode(data, (result) => this.conn.send(result)));
-    }
-  }
-  /**
-   * Return the next message ref, accounting for overflows
-   * @returns {string}
-   */
-  makeRef() {
-    let newRef = this.ref + 1;
-    if (newRef === this.ref) {
-      this.ref = 0;
-    } else {
-      this.ref = newRef;
-    }
-    return this.ref.toString();
-  }
-  sendHeartbeat() {
-    if (!this.isConnected()) {
-      try {
-        this.heartbeatCallback("disconnected");
-      } catch (e) {
-        this.log("error", "error in heartbeat callback", e);
-      }
-      return;
-    }
-    if (this.pendingHeartbeatRef) {
-      this.heartbeatTimeout();
-      return;
-    }
-    this.pendingHeartbeatRef = this.makeRef();
-    this.heartbeatSentAt = Date.now();
-    this.push({ topic: "phoenix", event: "heartbeat", payload: {}, ref: this.pendingHeartbeatRef });
-    try {
-      this.heartbeatCallback("sent");
-    } catch (e) {
-      this.log("error", "error in heartbeat callback", e);
-    }
-    this.heartbeatTimeoutTimer = setTimeout(() => this.heartbeatTimeout(), this.heartbeatIntervalMs);
-  }
-  flushSendBuffer() {
-    if (this.isConnected() && this.sendBuffer.length > 0) {
-      this.sendBuffer.forEach((callback) => callback());
-      this.sendBuffer = [];
-    }
-  }
-  /**
-  * @param {MessageEvent<any>} rawMessage
-  */
-  onConnMessage(rawMessage) {
-    this.decode(rawMessage.data, (msg) => {
-      let { topic, event, payload, ref, join_ref } = msg;
-      if (ref && ref === this.pendingHeartbeatRef) {
-        const latency = this.heartbeatSentAt ? Date.now() - this.heartbeatSentAt : void 0;
-        this.clearHeartbeats();
-        try {
-          this.heartbeatCallback(payload.status === "ok" ? "ok" : "error", latency);
-        } catch (e) {
-          this.log("error", "error in heartbeat callback", e);
-        }
-        this.pendingHeartbeatRef = null;
-        this.heartbeatSentAt = null;
-        if (this.autoSendHeartbeat) {
-          this.heartbeatTimer = setTimeout(() => this.sendHeartbeat(), this.heartbeatIntervalMs);
-        }
-      }
-      if (this.hasLogger()) this.log("receive", `${payload.status || ""} ${topic} ${event} ${ref && "(" + ref + ")" || ""}`.trim(), payload);
-      for (let i = 0; i < this.channels.length; i++) {
-        const channel = this.channels[i];
-        if (!channel.isMember(topic, event, payload, join_ref)) {
-          continue;
-        }
-        channel.trigger(event, payload, ref, join_ref);
-      }
-      this.triggerStateCallbacks("message", msg);
-    });
-  }
-  /**
-   * @private
-   * @template {keyof SocketStateChangeCallbacks} K
-   * @param {K} event
-   * @param {...Parameters<SocketStateChangeCallbacks[K][number][1]>} args
-   * @returns {void}
-   */
-  triggerStateCallbacks(event, ...args) {
-    try {
-      this.stateChangeCallbacks[event].forEach(([_, callback]) => {
-        try {
-          callback(...args);
-        } catch (e) {
-          this.log("error", `error in ${event} callback`, e);
-        }
-      });
-    } catch (e) {
-      this.log("error", `error triggering ${event} callbacks`, e);
-    }
-  }
-  leaveOpenTopic(topic) {
-    let dupChannel = this.channels.find((c) => c.topic === topic && (c.isJoined() || c.isJoining()));
-    if (dupChannel) {
-      if (this.hasLogger()) this.log("transport", `leaving duplicate topic "${topic}"`);
-      dupChannel.leave();
-    }
-  }
-};
-//# sourceMappingURL=phoenix.cjs.js.map
-
-
-/***/ }),
-
 /***/ 9911:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -11873,10 +10076,11 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.REALTIME_CHANNEL_STATES = exports.REALTIME_SUBSCRIBE_STATES = exports.REALTIME_LISTEN_TYPES = exports.REALTIME_POSTGRES_CHANGES_LISTEN_EVENT = void 0;
 const tslib_1 = __nccwpck_require__(7647);
 const constants_1 = __nccwpck_require__(88);
+const push_1 = tslib_1.__importDefault(__nccwpck_require__(2292));
+const timer_1 = tslib_1.__importDefault(__nccwpck_require__(2983));
 const RealtimePresence_1 = tslib_1.__importDefault(__nccwpck_require__(5583));
 const Transformers = tslib_1.__importStar(__nccwpck_require__(1140));
 const transformers_1 = __nccwpck_require__(1140);
-const channelAdapter_1 = tslib_1.__importDefault(__nccwpck_require__(6257));
 var REALTIME_POSTGRES_CHANGES_LISTEN_EVENT;
 (function (REALTIME_POSTGRES_CHANGES_LISTEN_EVENT) {
     REALTIME_POSTGRES_CHANGES_LISTEN_EVENT["ALL"] = "*";
@@ -11905,24 +10109,6 @@ exports.REALTIME_CHANNEL_STATES = constants_1.CHANNEL_STATES;
  * and send and receive messages.
  */
 class RealtimeChannel {
-    get state() {
-        return this.channelAdapter.state;
-    }
-    set state(state) {
-        this.channelAdapter.state = state;
-    }
-    get joinedOnce() {
-        return this.channelAdapter.joinedOnce;
-    }
-    get timeout() {
-        return this.socket.timeout;
-    }
-    get joinPush() {
-        return this.channelAdapter.joinPush;
-    }
-    get rejoinTimer() {
-        return this.channelAdapter.rejoinTimer;
-    }
     /**
      * Creates a channel that can broadcast messages, sync presence, and listen to Postgres changes.
      *
@@ -11947,19 +10133,59 @@ class RealtimeChannel {
         this.params = params;
         this.socket = socket;
         this.bindings = {};
+        this.state = constants_1.CHANNEL_STATES.closed;
+        this.joinedOnce = false;
+        this.pushBuffer = [];
         this.subTopic = topic.replace(/^realtime:/i, '');
         this.params.config = Object.assign({
             broadcast: { ack: false, self: false },
             presence: { key: '', enabled: false },
             private: false,
         }, params.config);
-        this.channelAdapter = new channelAdapter_1.default(this.socket.socketAdapter, topic, this.params);
-        this.presence = new RealtimePresence_1.default(this);
+        this.timeout = this.socket.timeout;
+        this.joinPush = new push_1.default(this, constants_1.CHANNEL_EVENTS.join, this.params, this.timeout);
+        this.rejoinTimer = new timer_1.default(() => this._rejoinUntilConnected(), this.socket.reconnectAfterMs);
+        this.joinPush.receive('ok', () => {
+            this.state = constants_1.CHANNEL_STATES.joined;
+            this.rejoinTimer.reset();
+            this.pushBuffer.forEach((pushEvent) => pushEvent.send());
+            this.pushBuffer = [];
+        });
         this._onClose(() => {
+            this.rejoinTimer.reset();
+            this.socket.log('channel', `close ${this.topic} ${this._joinRef()}`);
+            this.state = constants_1.CHANNEL_STATES.closed;
             this.socket._remove(this);
         });
-        this._updateFilterTransform();
-        this.broadcastEndpointURL = (0, transformers_1.httpEndpointURL)(this.socket.socketAdapter.endPointURL());
+        this._onError((reason) => {
+            if (this._isLeaving() || this._isClosed()) {
+                return;
+            }
+            this.socket.log('channel', `error ${this.topic}`, reason);
+            this.state = constants_1.CHANNEL_STATES.errored;
+            this.rejoinTimer.scheduleTimeout();
+        });
+        this.joinPush.receive('timeout', () => {
+            if (!this._isJoining()) {
+                return;
+            }
+            this.socket.log('channel', `timeout ${this.topic}`, this.joinPush.timeout);
+            this.state = constants_1.CHANNEL_STATES.errored;
+            this.rejoinTimer.scheduleTimeout();
+        });
+        this.joinPush.receive('error', (reason) => {
+            if (this._isLeaving() || this._isClosed()) {
+                return;
+            }
+            this.socket.log('channel', `error ${this.topic}`, reason);
+            this.state = constants_1.CHANNEL_STATES.errored;
+            this.rejoinTimer.scheduleTimeout();
+        });
+        this._on(constants_1.CHANNEL_EVENTS.reply, {}, (payload, ref) => {
+            this._trigger(this._replyEventName(ref), payload);
+        });
+        this.presence = new RealtimePresence_1.default(this);
+        this.broadcastEndpointURL = (0, transformers_1.httpEndpointURL)(this.socket.endPoint);
         this.private = this.params.config.private || false;
         if (!this.private && ((_b = (_a = this.params.config) === null || _a === void 0 ? void 0 : _a.broadcast) === null || _b === void 0 ? void 0 : _b.replay)) {
             throw `tried to use replay on public channel '${this.topic}'. It must be a private channel.`;
@@ -11971,7 +10197,7 @@ class RealtimeChannel {
         if (!this.socket.isConnected()) {
             this.socket.connect();
         }
-        if (this.channelAdapter.isClosed()) {
+        if (this.state == constants_1.CHANNEL_STATES.closed) {
             const { config: { broadcast, presence, private: isPrivate }, } = this.params;
             const postgres_changes = (_b = (_a = this.bindings.postgres_changes) === null || _a === void 0 ? void 0 : _a.map((r) => r.filter)) !== null && _b !== void 0 ? _b : [];
             const presence_enabled = (!!this.bindings[REALTIME_LISTEN_TYPES.PRESENCE] &&
@@ -11987,15 +10213,14 @@ class RealtimeChannel {
             if (this.socket.accessTokenValue) {
                 accessTokenPayload.access_token = this.socket.accessTokenValue;
             }
-            this._onError((reason) => {
-                callback === null || callback === void 0 ? void 0 : callback(REALTIME_SUBSCRIBE_STATES.CHANNEL_ERROR, reason);
-            });
+            this._onError((e) => callback === null || callback === void 0 ? void 0 : callback(REALTIME_SUBSCRIBE_STATES.CHANNEL_ERROR, e));
             this._onClose(() => callback === null || callback === void 0 ? void 0 : callback(REALTIME_SUBSCRIBE_STATES.CLOSED));
             this.updateJoinPayload(Object.assign({ config }, accessTokenPayload));
-            this._updateFilterMessage();
-            this.channelAdapter
-                .subscribe(timeout)
+            this.joinedOnce = true;
+            this._rejoin(timeout);
+            this.joinPush
                 .receive('ok', async ({ postgres_changes }) => {
+                var _a;
                 // Only refresh auth if using callback-based tokens
                 if (!this.socket._isManualToken()) {
                     this.socket.setAuth();
@@ -12004,45 +10229,44 @@ class RealtimeChannel {
                     callback === null || callback === void 0 ? void 0 : callback(REALTIME_SUBSCRIBE_STATES.SUBSCRIBED);
                     return;
                 }
-                this._updatePostgresBindings(postgres_changes, callback);
+                else {
+                    const clientPostgresBindings = this.bindings.postgres_changes;
+                    const bindingsLen = (_a = clientPostgresBindings === null || clientPostgresBindings === void 0 ? void 0 : clientPostgresBindings.length) !== null && _a !== void 0 ? _a : 0;
+                    const newPostgresBindings = [];
+                    for (let i = 0; i < bindingsLen; i++) {
+                        const clientPostgresBinding = clientPostgresBindings[i];
+                        const { filter: { event, schema, table, filter }, } = clientPostgresBinding;
+                        const serverPostgresFilter = postgres_changes && postgres_changes[i];
+                        if (serverPostgresFilter &&
+                            serverPostgresFilter.event === event &&
+                            RealtimeChannel.isFilterValueEqual(serverPostgresFilter.schema, schema) &&
+                            RealtimeChannel.isFilterValueEqual(serverPostgresFilter.table, table) &&
+                            RealtimeChannel.isFilterValueEqual(serverPostgresFilter.filter, filter)) {
+                            newPostgresBindings.push(Object.assign(Object.assign({}, clientPostgresBinding), { id: serverPostgresFilter.id }));
+                        }
+                        else {
+                            this.unsubscribe();
+                            this.state = constants_1.CHANNEL_STATES.errored;
+                            callback === null || callback === void 0 ? void 0 : callback(REALTIME_SUBSCRIBE_STATES.CHANNEL_ERROR, new Error('mismatch between server and client bindings for postgres changes'));
+                            return;
+                        }
+                    }
+                    this.bindings.postgres_changes = newPostgresBindings;
+                    callback && callback(REALTIME_SUBSCRIBE_STATES.SUBSCRIBED);
+                    return;
+                }
             })
                 .receive('error', (error) => {
                 this.state = constants_1.CHANNEL_STATES.errored;
                 callback === null || callback === void 0 ? void 0 : callback(REALTIME_SUBSCRIBE_STATES.CHANNEL_ERROR, new Error(JSON.stringify(Object.values(error).join(', ') || 'error')));
+                return;
             })
                 .receive('timeout', () => {
                 callback === null || callback === void 0 ? void 0 : callback(REALTIME_SUBSCRIBE_STATES.TIMED_OUT);
+                return;
             });
         }
         return this;
-    }
-    _updatePostgresBindings(postgres_changes, callback) {
-        var _a;
-        const clientPostgresBindings = this.bindings.postgres_changes;
-        const bindingsLen = (_a = clientPostgresBindings === null || clientPostgresBindings === void 0 ? void 0 : clientPostgresBindings.length) !== null && _a !== void 0 ? _a : 0;
-        const newPostgresBindings = [];
-        for (let i = 0; i < bindingsLen; i++) {
-            const clientPostgresBinding = clientPostgresBindings[i];
-            const { filter: { event, schema, table, filter }, } = clientPostgresBinding;
-            const serverPostgresFilter = postgres_changes && postgres_changes[i];
-            if (serverPostgresFilter &&
-                serverPostgresFilter.event === event &&
-                RealtimeChannel.isFilterValueEqual(serverPostgresFilter.schema, schema) &&
-                RealtimeChannel.isFilterValueEqual(serverPostgresFilter.table, table) &&
-                RealtimeChannel.isFilterValueEqual(serverPostgresFilter.filter, filter)) {
-                newPostgresBindings.push(Object.assign(Object.assign({}, clientPostgresBinding), { id: serverPostgresFilter.id }));
-            }
-            else {
-                this.unsubscribe();
-                this.state = constants_1.CHANNEL_STATES.errored;
-                callback === null || callback === void 0 ? void 0 : callback(REALTIME_SUBSCRIBE_STATES.CHANNEL_ERROR, new Error('mismatch between server and client bindings for postgres changes'));
-                return;
-            }
-        }
-        this.bindings.postgres_changes = newPostgresBindings;
-        if (this.state != constants_1.CHANNEL_STATES.errored && callback) {
-            callback(REALTIME_SUBSCRIBE_STATES.SUBSCRIBED);
-        }
     }
     /**
      * Returns the current presence state for this channel.
@@ -12074,9 +10298,9 @@ class RealtimeChannel {
         }, opts);
     }
     on(type, filter, callback) {
-        if (this.channelAdapter.isJoined() && type === REALTIME_LISTEN_TYPES.PRESENCE) {
-            this.socket.log('channel', `cannot add presence callbacks for ${this.topic} after joining.`);
-            throw new Error('cannot add presence callbacks after joining a channel');
+        if (this.state === constants_1.CHANNEL_STATES.joined && type === REALTIME_LISTEN_TYPES.PRESENCE) {
+            this.socket.log('channel', `resubscribe to ${this.topic} due to change in presence callbacks on joined channel`);
+            this.unsubscribe().then(async () => await this.subscribe());
         }
         return this._on(type, filter, callback);
     }
@@ -12140,7 +10364,7 @@ class RealtimeChannel {
      */
     async send(args, opts = {}) {
         var _a, _b;
-        if (!this.channelAdapter.canPush() && args.type === 'broadcast') {
+        if (!this._canPush() && args.type === 'broadcast') {
             console.warn('Realtime send() is automatically falling back to REST API. ' +
                 'This behavior will be deprecated in the future. ' +
                 'Please use httpSend() explicitly for REST delivery.');
@@ -12183,7 +10407,7 @@ class RealtimeChannel {
         else {
             return new Promise((resolve) => {
                 var _a, _b, _c;
-                const push = this.channelAdapter.push(args.type, args, opts.timeout || this.timeout);
+                const push = this._push(args.type, args, opts.timeout || this.timeout);
                 if (args.type === 'broadcast' && !((_c = (_b = (_a = this.params) === null || _a === void 0 ? void 0 : _a.config) === null || _b === void 0 ? void 0 : _b.broadcast) === null || _c === void 0 ? void 0 : _c.ack)) {
                     resolve('ok');
                 }
@@ -12198,7 +10422,7 @@ class RealtimeChannel {
      * Useful for rotating access tokens or updating config without re-creating the channel.
      */
     updateJoinPayload(payload) {
-        this.channelAdapter.updateJoinPayload(payload);
+        this.joinPush.updatePayload(payload);
     }
     /**
      * Leaves the channel.
@@ -12209,20 +10433,48 @@ class RealtimeChannel {
      * To receive leave acknowledgements, use the a `receive` hook to bind to the server ack, ie:
      * channel.unsubscribe().receive("ok", () => alert("left!") )
      */
-    async unsubscribe(timeout = this.timeout) {
+    unsubscribe(timeout = this.timeout) {
+        this.state = constants_1.CHANNEL_STATES.leaving;
+        const onClose = () => {
+            this.socket.log('channel', `leave ${this.topic}`);
+            this._trigger(constants_1.CHANNEL_EVENTS.close, 'leave', this._joinRef());
+        };
+        this.joinPush.destroy();
+        let leavePush = null;
         return new Promise((resolve) => {
-            this.channelAdapter
-                .unsubscribe(timeout)
-                .receive('ok', () => resolve('ok'))
-                .receive('timeout', () => resolve('timed out'))
-                .receive('error', () => resolve('error'));
+            leavePush = new push_1.default(this, constants_1.CHANNEL_EVENTS.leave, {}, timeout);
+            leavePush
+                .receive('ok', () => {
+                onClose();
+                resolve('ok');
+            })
+                .receive('timeout', () => {
+                onClose();
+                resolve('timed out');
+            })
+                .receive('error', () => {
+                resolve('error');
+            });
+            leavePush.send();
+            if (!this._canPush()) {
+                leavePush.trigger('ok', {});
+            }
+        }).finally(() => {
+            leavePush === null || leavePush === void 0 ? void 0 : leavePush.destroy();
         });
     }
     /**
+     * Teardown the channel.
+     *
      * Destroys and stops related timers.
      */
     teardown() {
-        this.channelAdapter.teardown();
+        this.pushBuffer.forEach((push) => push.destroy());
+        this.pushBuffer = [];
+        this.rejoinTimer.reset();
+        this.joinPush.destroy();
+        this.state = constants_1.CHANNEL_STATES.closed;
+        this.bindings = {};
     }
     /** @internal */
     async _fetchWithTimeout(url, options, timeout) {
@@ -12233,14 +10485,136 @@ class RealtimeChannel {
         return response;
     }
     /** @internal */
+    _push(event, payload, timeout = this.timeout) {
+        if (!this.joinedOnce) {
+            throw `tried to push '${event}' to '${this.topic}' before joining. Use channel.subscribe() before pushing events`;
+        }
+        let pushEvent = new push_1.default(this, event, payload, timeout);
+        if (this._canPush()) {
+            pushEvent.send();
+        }
+        else {
+            this._addToPushBuffer(pushEvent);
+        }
+        return pushEvent;
+    }
+    /** @internal */
+    _addToPushBuffer(pushEvent) {
+        pushEvent.startTimeout();
+        this.pushBuffer.push(pushEvent);
+        // Enforce buffer size limit
+        if (this.pushBuffer.length > constants_1.MAX_PUSH_BUFFER_SIZE) {
+            const removedPush = this.pushBuffer.shift();
+            if (removedPush) {
+                removedPush.destroy();
+                this.socket.log('channel', `discarded push due to buffer overflow: ${removedPush.event}`, removedPush.payload);
+            }
+        }
+    }
+    /**
+     * Overridable message hook
+     *
+     * Receives all events for specialized message handling before dispatching to the channel callbacks.
+     * Must return the payload, modified or unmodified.
+     *
+     * @internal
+     */
+    _onMessage(_event, payload, _ref) {
+        return payload;
+    }
+    /** @internal */
+    _isMember(topic) {
+        return this.topic === topic;
+    }
+    /** @internal */
+    _joinRef() {
+        return this.joinPush.ref;
+    }
+    /** @internal */
+    _trigger(type, payload, ref) {
+        var _a, _b;
+        const typeLower = type.toLocaleLowerCase();
+        const { close, error, leave, join } = constants_1.CHANNEL_EVENTS;
+        const events = [close, error, leave, join];
+        if (ref && events.indexOf(typeLower) >= 0 && ref !== this._joinRef()) {
+            return;
+        }
+        let handledPayload = this._onMessage(typeLower, payload, ref);
+        if (payload && !handledPayload) {
+            throw 'channel onMessage callbacks must return the payload, modified or unmodified';
+        }
+        if (['insert', 'update', 'delete'].includes(typeLower)) {
+            (_a = this.bindings.postgres_changes) === null || _a === void 0 ? void 0 : _a.filter((bind) => {
+                var _a, _b, _c;
+                return ((_a = bind.filter) === null || _a === void 0 ? void 0 : _a.event) === '*' || ((_c = (_b = bind.filter) === null || _b === void 0 ? void 0 : _b.event) === null || _c === void 0 ? void 0 : _c.toLocaleLowerCase()) === typeLower;
+            }).map((bind) => bind.callback(handledPayload, ref));
+        }
+        else {
+            (_b = this.bindings[typeLower]) === null || _b === void 0 ? void 0 : _b.filter((bind) => {
+                var _a, _b, _c, _d, _e, _f;
+                if (['broadcast', 'presence', 'postgres_changes'].includes(typeLower)) {
+                    if ('id' in bind) {
+                        const bindId = bind.id;
+                        const bindEvent = (_a = bind.filter) === null || _a === void 0 ? void 0 : _a.event;
+                        return (bindId &&
+                            ((_b = payload.ids) === null || _b === void 0 ? void 0 : _b.includes(bindId)) &&
+                            (bindEvent === '*' ||
+                                (bindEvent === null || bindEvent === void 0 ? void 0 : bindEvent.toLocaleLowerCase()) === ((_c = payload.data) === null || _c === void 0 ? void 0 : _c.type.toLocaleLowerCase())));
+                    }
+                    else {
+                        const bindEvent = (_e = (_d = bind === null || bind === void 0 ? void 0 : bind.filter) === null || _d === void 0 ? void 0 : _d.event) === null || _e === void 0 ? void 0 : _e.toLocaleLowerCase();
+                        return bindEvent === '*' || bindEvent === ((_f = payload === null || payload === void 0 ? void 0 : payload.event) === null || _f === void 0 ? void 0 : _f.toLocaleLowerCase());
+                    }
+                }
+                else {
+                    return bind.type.toLocaleLowerCase() === typeLower;
+                }
+            }).map((bind) => {
+                if (typeof handledPayload === 'object' && 'ids' in handledPayload) {
+                    const postgresChanges = handledPayload.data;
+                    const { schema, table, commit_timestamp, type, errors } = postgresChanges;
+                    const enrichedPayload = {
+                        schema: schema,
+                        table: table,
+                        commit_timestamp: commit_timestamp,
+                        eventType: type,
+                        new: {},
+                        old: {},
+                        errors: errors,
+                    };
+                    handledPayload = Object.assign(Object.assign({}, enrichedPayload), this._getPayloadRecords(postgresChanges));
+                }
+                bind.callback(handledPayload, ref);
+            });
+        }
+    }
+    /** @internal */
+    _isClosed() {
+        return this.state === constants_1.CHANNEL_STATES.closed;
+    }
+    /** @internal */
+    _isJoined() {
+        return this.state === constants_1.CHANNEL_STATES.joined;
+    }
+    /** @internal */
+    _isJoining() {
+        return this.state === constants_1.CHANNEL_STATES.joining;
+    }
+    /** @internal */
+    _isLeaving() {
+        return this.state === constants_1.CHANNEL_STATES.leaving;
+    }
+    /** @internal */
+    _replyEventName(ref) {
+        return `chan_reply_${ref}`;
+    }
+    /** @internal */
     _on(type, filter, callback) {
         const typeLower = type.toLocaleLowerCase();
-        const ref = this.channelAdapter.on(type, callback);
         const binding = {
             type: typeLower,
             filter: filter,
             callback: callback,
-            ref: ref,
         };
         if (this.bindings[typeLower]) {
             this.bindings[typeLower].push(binding);
@@ -12248,81 +10622,31 @@ class RealtimeChannel {
         else {
             this.bindings[typeLower] = [binding];
         }
-        this._updateFilterMessage();
         return this;
     }
-    /**
-     * Registers a callback that will be executed when the channel closes.
-     *
-     * @internal
-     */
-    _onClose(callback) {
-        this.channelAdapter.onClose(callback);
-    }
-    /**
-     * Registers a callback that will be executed when the channel encounteres an error.
-     *
-     * @internal
-     */
-    _onError(callback) {
-        this.channelAdapter.onError(callback);
+    /** @internal */
+    _off(type, filter) {
+        const typeLower = type.toLocaleLowerCase();
+        if (this.bindings[typeLower]) {
+            this.bindings[typeLower] = this.bindings[typeLower].filter((bind) => {
+                var _a;
+                return !(((_a = bind.type) === null || _a === void 0 ? void 0 : _a.toLocaleLowerCase()) === typeLower &&
+                    RealtimeChannel.isEqual(bind.filter, filter));
+            });
+        }
+        return this;
     }
     /** @internal */
-    _updateFilterMessage() {
-        this.channelAdapter.updateFilterBindings((binding, payload, ref) => {
-            var _a, _b, _c, _d, _e, _f, _g;
-            const typeLower = binding.event.toLocaleLowerCase();
-            if (this._notThisChannelEvent(typeLower, ref)) {
+    static isEqual(obj1, obj2) {
+        if (Object.keys(obj1).length !== Object.keys(obj2).length) {
+            return false;
+        }
+        for (const k in obj1) {
+            if (obj1[k] !== obj2[k]) {
                 return false;
             }
-            const bind = (_a = this.bindings[typeLower]) === null || _a === void 0 ? void 0 : _a.find((bind) => bind.ref === binding.ref);
-            if (!bind) {
-                return true;
-            }
-            if (['broadcast', 'presence', 'postgres_changes'].includes(typeLower)) {
-                if ('id' in bind) {
-                    const bindId = bind.id;
-                    const bindEvent = (_b = bind.filter) === null || _b === void 0 ? void 0 : _b.event;
-                    return (bindId &&
-                        ((_c = payload.ids) === null || _c === void 0 ? void 0 : _c.includes(bindId)) &&
-                        (bindEvent === '*' ||
-                            (bindEvent === null || bindEvent === void 0 ? void 0 : bindEvent.toLocaleLowerCase()) === ((_d = payload.data) === null || _d === void 0 ? void 0 : _d.type.toLocaleLowerCase())));
-                }
-                else {
-                    const bindEvent = (_f = (_e = bind === null || bind === void 0 ? void 0 : bind.filter) === null || _e === void 0 ? void 0 : _e.event) === null || _f === void 0 ? void 0 : _f.toLocaleLowerCase();
-                    return bindEvent === '*' || bindEvent === ((_g = payload === null || payload === void 0 ? void 0 : payload.event) === null || _g === void 0 ? void 0 : _g.toLocaleLowerCase());
-                }
-            }
-            else {
-                return bind.type.toLocaleLowerCase() === typeLower;
-            }
-        });
-    }
-    /** @internal */
-    _notThisChannelEvent(event, ref) {
-        const { close, error, leave, join } = constants_1.CHANNEL_EVENTS;
-        const events = [close, error, leave, join];
-        return ref && events.includes(event) && ref !== this.joinPush.ref;
-    }
-    /** @internal */
-    _updateFilterTransform() {
-        this.channelAdapter.updatePayloadTransform((event, payload, ref) => {
-            if (typeof payload === 'object' && 'ids' in payload) {
-                const postgresChanges = payload.data;
-                const { schema, table, commit_timestamp, type, errors } = postgresChanges;
-                const enrichedPayload = {
-                    schema: schema,
-                    table: table,
-                    commit_timestamp: commit_timestamp,
-                    eventType: type,
-                    new: {},
-                    old: {},
-                    errors: errors,
-                };
-                return Object.assign(Object.assign({}, enrichedPayload), this._getPayloadRecords(postgresChanges));
-            }
-            return payload;
-        });
+        }
+        return true;
     }
     /**
      * Compares two optional filter values for equality.
@@ -12333,6 +10657,46 @@ class RealtimeChannel {
         const normalizedServer = serverValue !== null && serverValue !== void 0 ? serverValue : undefined;
         const normalizedClient = clientValue !== null && clientValue !== void 0 ? clientValue : undefined;
         return normalizedServer === normalizedClient;
+    }
+    /** @internal */
+    _rejoinUntilConnected() {
+        this.rejoinTimer.scheduleTimeout();
+        if (this.socket.isConnected()) {
+            this._rejoin();
+        }
+    }
+    /**
+     * Registers a callback that will be executed when the channel closes.
+     *
+     * @internal
+     */
+    _onClose(callback) {
+        this._on(constants_1.CHANNEL_EVENTS.close, {}, callback);
+    }
+    /**
+     * Registers a callback that will be executed when the channel encounteres an error.
+     *
+     * @internal
+     */
+    _onError(callback) {
+        this._on(constants_1.CHANNEL_EVENTS.error, {}, (reason) => callback(reason));
+    }
+    /**
+     * Returns `true` if the socket is connected and the channel has been joined.
+     *
+     * @internal
+     */
+    _canPush() {
+        return this.socket.isConnected() && this._isJoined();
+    }
+    /** @internal */
+    _rejoin(timeout = this.timeout) {
+        if (this._isLeaving()) {
+            return;
+        }
+        this.socket._leaveOpenTopic(this.topic);
+        this.state = constants_1.CHANNEL_STATES.joining;
+        this.joinPush.resend(timeout);
     }
     /** @internal */
     _getPayloadRecords(payload) {
@@ -12364,9 +10728,10 @@ const tslib_1 = __nccwpck_require__(7647);
 const websocket_factory_1 = tslib_1.__importDefault(__nccwpck_require__(3478));
 const constants_1 = __nccwpck_require__(88);
 const serializer_1 = tslib_1.__importDefault(__nccwpck_require__(5360));
+const timer_1 = tslib_1.__importDefault(__nccwpck_require__(2983));
 const transformers_1 = __nccwpck_require__(1140);
 const RealtimeChannel_1 = tslib_1.__importDefault(__nccwpck_require__(9911));
-const socketAdapter_1 = tslib_1.__importDefault(__nccwpck_require__(8397));
+const noop = () => { };
 // Connection-related constants
 const CONNECTION_TIMEOUTS = {
     HEARTBEAT_INTERVAL: 25000,
@@ -12382,54 +10747,6 @@ const WORKER_SCRIPT = `
     }
   });`;
 class RealtimeClient {
-    get endPoint() {
-        return this.socketAdapter.endPoint;
-    }
-    get timeout() {
-        return this.socketAdapter.timeout;
-    }
-    get transport() {
-        return this.socketAdapter.transport;
-    }
-    get heartbeatCallback() {
-        return this.socketAdapter.heartbeatCallback;
-    }
-    get heartbeatIntervalMs() {
-        return this.socketAdapter.heartbeatIntervalMs;
-    }
-    get heartbeatTimer() {
-        if (this.worker) {
-            return this._workerHeartbeatTimer;
-        }
-        return this.socketAdapter.heartbeatTimer;
-    }
-    get pendingHeartbeatRef() {
-        if (this.worker) {
-            return this._pendingWorkerHeartbeatRef;
-        }
-        return this.socketAdapter.pendingHeartbeatRef;
-    }
-    get reconnectTimer() {
-        return this.socketAdapter.reconnectTimer;
-    }
-    get vsn() {
-        return this.socketAdapter.vsn;
-    }
-    get encode() {
-        return this.socketAdapter.encode;
-    }
-    get decode() {
-        return this.socketAdapter.decode;
-    }
-    get reconnectAfterMs() {
-        return this.socketAdapter.reconnectAfterMs;
-    }
-    get sendBuffer() {
-        return this.socketAdapter.sendBuffer;
-    }
-    get stateChangeCallbacks() {
-        return this.socketAdapter.stateChangeCallbacks;
-    }
     /**
      * Initializes the Socket.
      *
@@ -12461,20 +10778,39 @@ class RealtimeClient {
      */
     constructor(endPoint, options) {
         var _a;
-        this.channels = new Array();
         this.accessTokenValue = null;
-        this.accessToken = null;
         this.apiKey = null;
+        this._manuallySetToken = false;
+        this.channels = new Array();
+        this.endPoint = '';
         this.httpEndpoint = '';
         /** @deprecated headers cannot be set on websocket connections */
         this.headers = {};
         this.params = {};
+        this.timeout = constants_1.DEFAULT_TIMEOUT;
+        this.transport = null;
+        this.heartbeatIntervalMs = CONNECTION_TIMEOUTS.HEARTBEAT_INTERVAL;
+        this.heartbeatTimer = undefined;
+        this.pendingHeartbeatRef = null;
+        this.heartbeatCallback = noop;
         this.ref = 0;
+        this.reconnectTimer = null;
+        this.vsn = constants_1.DEFAULT_VSN;
+        this.logger = noop;
+        this.conn = null;
+        this.sendBuffer = [];
         this.serializer = new serializer_1.default();
-        this._manuallySetToken = false;
+        this.stateChangeCallbacks = {
+            open: [],
+            close: [],
+            error: [],
+            message: [],
+        };
+        this.accessToken = null;
+        this._connectionState = 'disconnected';
+        this._wasManualDisconnect = false;
         this._authPromise = null;
-        this._workerHeartbeatTimer = undefined;
-        this._pendingWorkerHeartbeatRef = null;
+        this._heartbeatSentAt = null;
         /**
          * Use either custom fetch, if provided, or default fetch to make HTTP requests
          *
@@ -12491,9 +10827,11 @@ class RealtimeClient {
             throw new Error('API key is required to connect to Realtime');
         }
         this.apiKey = options.params.apikey;
-        const socketAdapterOptions = this._initializeOptions(options);
-        this.socketAdapter = new socketAdapter_1.default(endPoint, socketAdapterOptions);
+        // Initialize endpoint URLs
+        this.endPoint = `${endPoint}/${constants_1.TRANSPORTS.websocket}`;
         this.httpEndpoint = (0, transformers_1.httpEndpointURL)(endPoint);
+        this._initializeOptions(options);
+        this._setupReconnectionTimer();
         this.fetch = this._resolveFetch(options === null || options === void 0 ? void 0 : options.fetch);
     }
     /**
@@ -12501,44 +10839,55 @@ class RealtimeClient {
      */
     connect() {
         // Skip if already connecting, disconnecting, or connected
-        if (this.isConnecting() || this.isDisconnecting() || this.isConnected()) {
+        if (this.isConnecting() ||
+            this.isDisconnecting() ||
+            (this.conn !== null && this.isConnected())) {
             return;
         }
+        this._setConnectionState('connecting');
         // Trigger auth if needed and not already in progress
         // This ensures auth is called for standalone RealtimeClient usage
         // while avoiding race conditions with SupabaseClient's immediate setAuth call
         if (this.accessToken && !this._authPromise) {
             this._setAuthSafely('connect');
         }
-        this._setupConnectionHandlers();
-        try {
-            this.socketAdapter.connect();
+        // Establish WebSocket connection
+        if (this.transport) {
+            // Use custom transport if provided
+            this.conn = new this.transport(this.endpointURL());
         }
-        catch (error) {
-            const errorMessage = error.message;
-            // Provide helpful error message based on environment
-            if (errorMessage.includes('Node.js')) {
-                throw new Error(`${errorMessage}\n\n` +
-                    'To use Realtime in Node.js, you need to provide a WebSocket implementation:\n\n' +
-                    'Option 1: Use Node.js 22+ which has native WebSocket support\n' +
-                    'Option 2: Install and provide the "ws" package:\n\n' +
-                    '  npm install ws\n\n' +
-                    '  import ws from "ws"\n' +
-                    '  const client = new RealtimeClient(url, {\n' +
-                    '    ...options,\n' +
-                    '    transport: ws\n' +
-                    '  })');
+        else {
+            // Try to use native WebSocket
+            try {
+                this.conn = websocket_factory_1.default.createWebSocket(this.endpointURL());
             }
-            throw new Error(`WebSocket not available: ${errorMessage}`);
+            catch (error) {
+                this._setConnectionState('disconnected');
+                const errorMessage = error.message;
+                // Provide helpful error message based on environment
+                if (errorMessage.includes('Node.js')) {
+                    throw new Error(`${errorMessage}\n\n` +
+                        'To use Realtime in Node.js, you need to provide a WebSocket implementation:\n\n' +
+                        'Option 1: Use Node.js 22+ which has native WebSocket support\n' +
+                        'Option 2: Install and provide the "ws" package:\n\n' +
+                        '  npm install ws\n\n' +
+                        '  import ws from "ws"\n' +
+                        '  const client = new RealtimeClient(url, {\n' +
+                        '    ...options,\n' +
+                        '    transport: ws\n' +
+                        '  })');
+                }
+                throw new Error(`WebSocket not available: ${errorMessage}`);
+            }
         }
-        this._handleNodeJsRaceCondition();
+        this._setupConnectionHandlers();
     }
     /**
      * Returns the URL of the websocket.
      * @returns string The URL of the websocket.
      */
     endpointURL() {
-        return this.socketAdapter.endPointURL();
+        return this._appendParams(this.endPoint, Object.assign({}, this.params, { vsn: this.vsn }));
     }
     /**
      * Disconnects the socket.
@@ -12546,14 +10895,34 @@ class RealtimeClient {
      * @param code A numeric status code to send on disconnect.
      * @param reason A custom reason for the disconnect.
      */
-    async disconnect(code, reason) {
+    disconnect(code, reason) {
         if (this.isDisconnecting()) {
-            return 'ok';
+            return;
         }
-        return await this.socketAdapter.disconnect(() => {
-            clearInterval(this._workerHeartbeatTimer);
-            this._terminateWorker();
-        }, code, reason);
+        this._setConnectionState('disconnecting', true);
+        if (this.conn) {
+            // Setup fallback timer to prevent hanging in disconnecting state
+            const fallbackTimer = setTimeout(() => {
+                this._setConnectionState('disconnected');
+            }, 100);
+            this.conn.onclose = () => {
+                clearTimeout(fallbackTimer);
+                this._setConnectionState('disconnected');
+            };
+            // Close the WebSocket connection if close method exists
+            if (typeof this.conn.close === 'function') {
+                if (code) {
+                    this.conn.close(code, reason !== null && reason !== void 0 ? reason : '');
+                }
+                else {
+                    this.conn.close();
+                }
+            }
+            this._teardownConnection();
+        }
+        else {
+            this._setConnectionState('disconnected');
+        }
     }
     /**
      * Returns all created channels
@@ -12562,63 +10931,65 @@ class RealtimeClient {
         return this.channels;
     }
     /**
-     * Unsubscribes, removes and tears down a single channel
+     * Unsubscribes and removes a single channel
      * @param channel A RealtimeChannel instance
      */
     async removeChannel(channel) {
         const status = await channel.unsubscribe();
-        if (status === 'ok') {
-            channel.teardown();
-        }
         if (this.channels.length === 0) {
             this.disconnect();
         }
         return status;
     }
     /**
-     * Unsubscribes, removes and tears down all channels
+     * Unsubscribes and removes all channels
      */
     async removeAllChannels() {
-        const promises = this.channels.map(async (channel) => {
-            const result = await channel.unsubscribe();
-            channel.teardown();
-            return result;
-        });
-        const result = await Promise.all(promises);
+        const values_1 = await Promise.all(this.channels.map((channel) => channel.unsubscribe()));
+        this.channels = [];
         this.disconnect();
-        return result;
+        return values_1;
     }
     /**
      * Logs the message.
      *
-     * For customized logging, `this.logger` can be overridden in Client constructor.
+     * For customized logging, `this.logger` can be overridden.
      */
     log(kind, msg, data) {
-        this.socketAdapter.log(kind, msg, data);
+        this.logger(kind, msg, data);
     }
     /**
      * Returns the current state of the socket.
      */
     connectionState() {
-        return this.socketAdapter.connectionState() || constants_1.CONNECTION_STATE.closed;
+        switch (this.conn && this.conn.readyState) {
+            case constants_1.SOCKET_STATES.connecting:
+                return constants_1.CONNECTION_STATE.Connecting;
+            case constants_1.SOCKET_STATES.open:
+                return constants_1.CONNECTION_STATE.Open;
+            case constants_1.SOCKET_STATES.closing:
+                return constants_1.CONNECTION_STATE.Closing;
+            default:
+                return constants_1.CONNECTION_STATE.Closed;
+        }
     }
     /**
      * Returns `true` is the connection is open.
      */
     isConnected() {
-        return this.socketAdapter.isConnected();
+        return this.connectionState() === constants_1.CONNECTION_STATE.Open;
     }
     /**
      * Returns `true` if the connection is currently connecting.
      */
     isConnecting() {
-        return this.socketAdapter.isConnecting();
+        return this._connectionState === 'connecting';
     }
     /**
      * Returns `true` if the connection is currently disconnecting.
      */
     isDisconnecting() {
-        return this.socketAdapter.isDisconnecting();
+        return this._connectionState === 'disconnecting';
     }
     /**
      * Creates (or reuses) a {@link RealtimeChannel} for the provided topic.
@@ -12645,7 +11016,20 @@ class RealtimeClient {
      * If the socket is not connected, the message gets enqueued within a local buffer, and sent out when a connection is next established.
      */
     push(data) {
-        this.socketAdapter.push(data);
+        const { topic, event, payload, ref } = data;
+        const callback = () => {
+            this.encode(data, (result) => {
+                var _a;
+                (_a = this.conn) === null || _a === void 0 ? void 0 : _a.send(result);
+            });
+        };
+        this.log('push', `${topic} ${event} (${ref})`, payload);
+        if (this.isConnected()) {
+            callback();
+        }
+        else {
+            this.sendBuffer.push(callback);
+        }
     }
     /**
      * Sets the JWT access token used for channel subscription authorization and Realtime RLS.
@@ -12688,14 +11072,70 @@ class RealtimeClient {
      * Sends a heartbeat message if the socket is connected.
      */
     async sendHeartbeat() {
-        this.socketAdapter.sendHeartbeat();
+        var _a;
+        if (!this.isConnected()) {
+            try {
+                this.heartbeatCallback('disconnected');
+            }
+            catch (e) {
+                this.log('error', 'error in heartbeat callback', e);
+            }
+            return;
+        }
+        // Handle heartbeat timeout and force reconnection if needed
+        if (this.pendingHeartbeatRef) {
+            this.pendingHeartbeatRef = null;
+            this._heartbeatSentAt = null;
+            this.log('transport', 'heartbeat timeout. Attempting to re-establish connection');
+            try {
+                this.heartbeatCallback('timeout');
+            }
+            catch (e) {
+                this.log('error', 'error in heartbeat callback', e);
+            }
+            // Force reconnection after heartbeat timeout
+            this._wasManualDisconnect = false;
+            (_a = this.conn) === null || _a === void 0 ? void 0 : _a.close(constants_1.WS_CLOSE_NORMAL, 'heartbeat timeout');
+            setTimeout(() => {
+                var _a;
+                if (!this.isConnected()) {
+                    (_a = this.reconnectTimer) === null || _a === void 0 ? void 0 : _a.scheduleTimeout();
+                }
+            }, CONNECTION_TIMEOUTS.HEARTBEAT_TIMEOUT_FALLBACK);
+            return;
+        }
+        // Send heartbeat message to server
+        this._heartbeatSentAt = Date.now();
+        this.pendingHeartbeatRef = this._makeRef();
+        this.push({
+            topic: 'phoenix',
+            event: 'heartbeat',
+            payload: {},
+            ref: this.pendingHeartbeatRef,
+        });
+        try {
+            this.heartbeatCallback('sent');
+        }
+        catch (e) {
+            this.log('error', 'error in heartbeat callback', e);
+        }
+        this._setAuthSafely('heartbeat');
     }
     /**
      * Sets a callback that receives lifecycle events for internal heartbeat messages.
      * Useful for instrumenting connection health (e.g. sent/ok/timeout/disconnected).
      */
     onHeartbeat(callback) {
-        this.socketAdapter.heartbeatCallback = this._wrapHeartbeatCallback(callback);
+        this.heartbeatCallback = callback;
+    }
+    /**
+     * Flushes send buffer
+     */
+    flushSendBuffer() {
+        if (this.isConnected() && this.sendBuffer.length > 0) {
+            this.sendBuffer.forEach((callback) => callback());
+            this.sendBuffer = [];
+        }
     }
     /**
      * Return the next message ref, accounting for overflows
@@ -12703,10 +11143,29 @@ class RealtimeClient {
      * @internal
      */
     _makeRef() {
-        return this.socketAdapter.makeRef();
+        let newRef = this.ref + 1;
+        if (newRef === this.ref) {
+            this.ref = 0;
+        }
+        else {
+            this.ref = newRef;
+        }
+        return this.ref.toString();
     }
     /**
-     * Removes a channel from RealtimeClient
+     * Unsubscribe from channels with the specified topic.
+     *
+     * @internal
+     */
+    _leaveOpenTopic(topic) {
+        let dupChannel = this.channels.find((c) => c.topic === topic && (c._isJoined() || c._isJoining()));
+        if (dupChannel) {
+            this.log('transport', `leaving duplicate topic "${topic}"`);
+            dupChannel.unsubscribe();
+        }
+    }
+    /**
+     * Removes a subscription from the socket.
      *
      * @param channel An open subscription.
      *
@@ -12714,6 +11173,262 @@ class RealtimeClient {
      */
     _remove(channel) {
         this.channels = this.channels.filter((c) => c.topic !== channel.topic);
+    }
+    /** @internal */
+    _onConnMessage(rawMessage) {
+        this.decode(rawMessage.data, (msg) => {
+            // Handle heartbeat responses
+            if (msg.topic === 'phoenix' &&
+                msg.event === 'phx_reply' &&
+                msg.ref &&
+                msg.ref === this.pendingHeartbeatRef) {
+                const latency = this._heartbeatSentAt ? Date.now() - this._heartbeatSentAt : undefined;
+                try {
+                    this.heartbeatCallback(msg.payload.status === 'ok' ? 'ok' : 'error', latency);
+                }
+                catch (e) {
+                    this.log('error', 'error in heartbeat callback', e);
+                }
+                this._heartbeatSentAt = null;
+                this.pendingHeartbeatRef = null;
+            }
+            // Log incoming message
+            const { topic, event, payload, ref } = msg;
+            const refString = ref ? `(${ref})` : '';
+            const status = payload.status || '';
+            this.log('receive', `${status} ${topic} ${event} ${refString}`.trim(), payload);
+            // Route message to appropriate channels
+            this.channels
+                .filter((channel) => channel._isMember(topic))
+                .forEach((channel) => channel._trigger(event, payload, ref));
+            this._triggerStateCallbacks('message', msg);
+        });
+    }
+    /**
+     * Clear specific timer
+     * @internal
+     */
+    _clearTimer(timer) {
+        var _a;
+        if (timer === 'heartbeat' && this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = undefined;
+        }
+        else if (timer === 'reconnect') {
+            (_a = this.reconnectTimer) === null || _a === void 0 ? void 0 : _a.reset();
+        }
+    }
+    /**
+     * Clear all timers
+     * @internal
+     */
+    _clearAllTimers() {
+        this._clearTimer('heartbeat');
+        this._clearTimer('reconnect');
+    }
+    /**
+     * Setup connection handlers for WebSocket events
+     * @internal
+     */
+    _setupConnectionHandlers() {
+        if (!this.conn)
+            return;
+        // Set binary type if supported (browsers and most WebSocket implementations)
+        if ('binaryType' in this.conn) {
+            ;
+            this.conn.binaryType = 'arraybuffer';
+        }
+        this.conn.onopen = () => this._onConnOpen();
+        this.conn.onerror = (error) => this._onConnError(error);
+        this.conn.onmessage = (event) => this._onConnMessage(event);
+        this.conn.onclose = (event) => this._onConnClose(event);
+        if (this.conn.readyState === constants_1.SOCKET_STATES.open) {
+            this._onConnOpen();
+        }
+    }
+    /**
+     * Teardown connection and cleanup resources
+     * @internal
+     */
+    _teardownConnection() {
+        if (this.conn) {
+            if (this.conn.readyState === constants_1.SOCKET_STATES.open ||
+                this.conn.readyState === constants_1.SOCKET_STATES.connecting) {
+                try {
+                    this.conn.close();
+                }
+                catch (e) {
+                    this.log('error', 'Error closing connection', e);
+                }
+            }
+            this.conn.onopen = null;
+            this.conn.onerror = null;
+            this.conn.onmessage = null;
+            this.conn.onclose = null;
+            this.conn = null;
+        }
+        this._clearAllTimers();
+        this._terminateWorker();
+        this.channels.forEach((channel) => channel.teardown());
+    }
+    /** @internal */
+    _onConnOpen() {
+        this._setConnectionState('connected');
+        this.log('transport', `connected to ${this.endpointURL()}`);
+        // Wait for any pending auth operations before flushing send buffer
+        // This ensures channel join messages include the correct access token
+        const authPromise = this._authPromise ||
+            (this.accessToken && !this.accessTokenValue ? this.setAuth() : Promise.resolve());
+        authPromise
+            .then(() => {
+            // When subscribe() is called before the accessToken callback has
+            // resolved (common on React Native / Expo where token storage is
+            // async), the phx_join payload captured at subscribe()-time will
+            // have no access_token.  By this point auth has settled and
+            // this.accessTokenValue holds the real JWT.
+            //
+            // The stale join messages sitting in sendBuffer captured the old
+            // (token-less) payload in a closure, so we cannot simply flush
+            // them.  Instead we:
+            //   1. Patch each channel's joinPush payload with the real token
+            //   2. Drop the stale buffered messages
+            //   3. Re-send the join for any channel still in "joining" state
+            //
+            // On browsers this is a harmless no-op: accessTokenValue was
+            // already set synchronously before subscribe() ran, so the join
+            // payload already had the correct token.
+            if (this.accessTokenValue) {
+                this.channels.forEach((channel) => {
+                    channel.updateJoinPayload({ access_token: this.accessTokenValue });
+                });
+                this.sendBuffer = [];
+                this.channels.forEach((channel) => {
+                    if (channel._isJoining()) {
+                        channel.joinPush.sent = false;
+                        channel.joinPush.send();
+                    }
+                });
+            }
+            this.flushSendBuffer();
+        })
+            .catch((e) => {
+            this.log('error', 'error waiting for auth on connect', e);
+            // Proceed anyway to avoid hanging connections
+            this.flushSendBuffer();
+        });
+        this._clearTimer('reconnect');
+        if (!this.worker) {
+            this._startHeartbeat();
+        }
+        else {
+            if (!this.workerRef) {
+                this._startWorkerHeartbeat();
+            }
+        }
+        this._triggerStateCallbacks('open');
+    }
+    /** @internal */
+    _startHeartbeat() {
+        this.heartbeatTimer && clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), this.heartbeatIntervalMs);
+    }
+    /** @internal */
+    _startWorkerHeartbeat() {
+        if (this.workerUrl) {
+            this.log('worker', `starting worker for from ${this.workerUrl}`);
+        }
+        else {
+            this.log('worker', `starting default worker`);
+        }
+        const objectUrl = this._workerObjectUrl(this.workerUrl);
+        this.workerRef = new Worker(objectUrl);
+        this.workerRef.onerror = (error) => {
+            this.log('worker', 'worker error', error.message);
+            this._terminateWorker();
+        };
+        this.workerRef.onmessage = (event) => {
+            if (event.data.event === 'keepAlive') {
+                this.sendHeartbeat();
+            }
+        };
+        this.workerRef.postMessage({
+            event: 'start',
+            interval: this.heartbeatIntervalMs,
+        });
+    }
+    /**
+     * Terminate the Web Worker and clear the reference
+     * @internal
+     */
+    _terminateWorker() {
+        if (this.workerRef) {
+            this.log('worker', 'terminating worker');
+            this.workerRef.terminate();
+            this.workerRef = undefined;
+        }
+    }
+    /** @internal */
+    _onConnClose(event) {
+        var _a;
+        this._setConnectionState('disconnected');
+        this.log('transport', 'close', event);
+        this._triggerChanError();
+        this._clearTimer('heartbeat');
+        // Only schedule reconnection if it wasn't a manual disconnect
+        if (!this._wasManualDisconnect) {
+            (_a = this.reconnectTimer) === null || _a === void 0 ? void 0 : _a.scheduleTimeout();
+        }
+        this._triggerStateCallbacks('close', event);
+    }
+    /** @internal */
+    _onConnError(error) {
+        this._setConnectionState('disconnected');
+        this.log('transport', `${error}`);
+        this._triggerChanError();
+        this._triggerStateCallbacks('error', error);
+        try {
+            this.heartbeatCallback('error');
+        }
+        catch (e) {
+            this.log('error', 'error in heartbeat callback', e);
+        }
+    }
+    /** @internal */
+    _triggerChanError() {
+        this.channels.forEach((channel) => channel._trigger(constants_1.CHANNEL_EVENTS.error));
+    }
+    /** @internal */
+    _appendParams(url, params) {
+        if (Object.keys(params).length === 0) {
+            return url;
+        }
+        const prefix = url.match(/\?/) ? '&' : '?';
+        const query = new URLSearchParams(params);
+        return `${url}${prefix}${query}`;
+    }
+    _workerObjectUrl(url) {
+        let result_url;
+        if (url) {
+            result_url = url;
+        }
+        else {
+            const blob = new Blob([WORKER_SCRIPT], { type: 'application/javascript' });
+            result_url = URL.createObjectURL(blob);
+        }
+        return result_url;
+    }
+    /**
+     * Set connection state with proper state management
+     * @internal
+     */
+    _setConnectionState(state, manual = false) {
+        this._connectionState = state;
+        if (state === 'connecting') {
+            this._wasManualDisconnect = false;
+        }
+        else if (state === 'disconnecting') {
+            this._wasManualDisconnect = manual;
+        }
     }
     /**
      * Perform the actual auth operation
@@ -12757,8 +11472,8 @@ class RealtimeClient {
                     version: constants_1.DEFAULT_VERSION,
                 };
                 tokenToSend && channel.updateJoinPayload(payload);
-                if (channel.joinedOnce && channel.channelAdapter.isJoined()) {
-                    channel.channelAdapter.push(constants_1.CHANNEL_EVENTS.access_token, {
+                if (channel.joinedOnce && channel._isJoined()) {
+                    channel._push(constants_1.CHANNEL_EVENTS.access_token, {
                         access_token: tokenToSend,
                     });
                 }
@@ -12786,140 +11501,85 @@ class RealtimeClient {
             });
         }
     }
-    /** @internal */
-    _setupConnectionHandlers() {
-        this.socketAdapter.onOpen(() => {
-            const authPromise = this._authPromise ||
-                (this.accessToken && !this.accessTokenValue ? this.setAuth() : Promise.resolve());
-            authPromise.catch((e) => {
-                this.log('error', 'error waiting for auth on connect', e);
-            });
-            if (this.worker && !this.workerRef) {
-                this._startWorkerHeartbeat();
-            }
-        });
-        this.socketAdapter.onClose(() => {
-            if (this.worker && this.workerRef) {
-                this._terminateWorker();
-            }
-        });
-        this.socketAdapter.onMessage((message) => {
-            if (message.ref && message.ref === this._pendingWorkerHeartbeatRef) {
-                this._pendingWorkerHeartbeatRef = null;
-            }
-        });
-    }
-    /** @internal */
-    _handleNodeJsRaceCondition() {
-        if (this.socketAdapter.isConnected()) {
-            // hack: ensure onConnOpen is called
-            this.socketAdapter.getSocket().onConnOpen();
-        }
-    }
-    /** @internal */
-    _wrapHeartbeatCallback(heartbeatCallback) {
-        return (status, latency) => {
-            if (status == 'sent')
-                this._setAuthSafely();
-            if (heartbeatCallback)
-                heartbeatCallback(status, latency);
-        };
-    }
-    /** @internal */
-    _startWorkerHeartbeat() {
-        if (this.workerUrl) {
-            this.log('worker', `starting worker for from ${this.workerUrl}`);
-        }
-        else {
-            this.log('worker', `starting default worker`);
-        }
-        const objectUrl = this._workerObjectUrl(this.workerUrl);
-        this.workerRef = new Worker(objectUrl);
-        this.workerRef.onerror = (error) => {
-            this.log('worker', 'worker error', error.message);
-            this._terminateWorker();
-            this.disconnect();
-        };
-        this.workerRef.onmessage = (event) => {
-            if (event.data.event === 'keepAlive') {
-                this.sendHeartbeat();
-            }
-        };
-        this.workerRef.postMessage({
-            event: 'start',
-            interval: this.heartbeatIntervalMs,
-        });
-    }
     /**
-     * Terminate the Web Worker and clear the reference
+     * Trigger state change callbacks with proper error handling
      * @internal
      */
-    _terminateWorker() {
-        if (this.workerRef) {
-            this.log('worker', 'terminating worker');
-            this.workerRef.terminate();
-            this.workerRef = undefined;
+    _triggerStateCallbacks(event, data) {
+        try {
+            this.stateChangeCallbacks[event].forEach((callback) => {
+                try {
+                    callback(data);
+                }
+                catch (e) {
+                    this.log('error', `error in ${event} callback`, e);
+                }
+            });
         }
-    }
-    /** @internal */
-    _workerObjectUrl(url) {
-        let result_url;
-        if (url) {
-            result_url = url;
+        catch (e) {
+            this.log('error', `error triggering ${event} callbacks`, e);
         }
-        else {
-            const blob = new Blob([WORKER_SCRIPT], { type: 'application/javascript' });
-            result_url = URL.createObjectURL(blob);
-        }
-        return result_url;
     }
     /**
-     * Initialize socket options with defaults
+     * Setup reconnection timer with proper configuration
+     * @internal
+     */
+    _setupReconnectionTimer() {
+        this.reconnectTimer = new timer_1.default(async () => {
+            setTimeout(async () => {
+                await this._waitForAuthIfNeeded();
+                if (!this.isConnected()) {
+                    this.connect();
+                }
+            }, CONNECTION_TIMEOUTS.RECONNECT_DELAY);
+        }, this.reconnectAfterMs);
+    }
+    /**
+     * Initialize client options with defaults
      * @internal
      */
     _initializeOptions(options) {
-        var _a, _b, _c, _d, _e, _f, _g, _h, _j;
-        this.worker = (_a = options === null || options === void 0 ? void 0 : options.worker) !== null && _a !== void 0 ? _a : false;
-        this.accessToken = (_b = options === null || options === void 0 ? void 0 : options.accessToken) !== null && _b !== void 0 ? _b : null;
-        const result = {};
-        result.timeout = (_c = options === null || options === void 0 ? void 0 : options.timeout) !== null && _c !== void 0 ? _c : constants_1.DEFAULT_TIMEOUT;
-        result.heartbeatIntervalMs =
-            (_d = options === null || options === void 0 ? void 0 : options.heartbeatIntervalMs) !== null && _d !== void 0 ? _d : CONNECTION_TIMEOUTS.HEARTBEAT_INTERVAL;
-        // @ts-ignore - mismatch between phoenix and supabase
-        result.transport = (_e = options === null || options === void 0 ? void 0 : options.transport) !== null && _e !== void 0 ? _e : websocket_factory_1.default.getWebSocketConstructor();
-        result.params = options === null || options === void 0 ? void 0 : options.params;
-        result.logger = options === null || options === void 0 ? void 0 : options.logger;
-        result.heartbeatCallback = this._wrapHeartbeatCallback(options === null || options === void 0 ? void 0 : options.heartbeatCallback);
-        result.reconnectAfterMs =
-            (_f = options === null || options === void 0 ? void 0 : options.reconnectAfterMs) !== null && _f !== void 0 ? _f : ((tries) => {
-                return RECONNECT_INTERVALS[tries - 1] || DEFAULT_RECONNECT_FALLBACK;
-            });
-        let defaultEncode;
-        let defaultDecode;
-        const vsn = (_g = options === null || options === void 0 ? void 0 : options.vsn) !== null && _g !== void 0 ? _g : constants_1.DEFAULT_VSN;
-        switch (vsn) {
-            case constants_1.VSN_1_0_0:
-                defaultEncode = (payload, callback) => {
-                    return callback(JSON.stringify(payload));
-                };
-                defaultDecode = (payload, callback) => {
-                    return callback(JSON.parse(payload));
-                };
-                break;
-            case constants_1.VSN_2_0_0:
-                defaultEncode = this.serializer.encode.bind(this.serializer);
-                defaultDecode = this.serializer.decode.bind(this.serializer);
-                break;
-            default:
-                throw new Error(`Unsupported serializer version: ${result.vsn}`);
-        }
-        result.vsn = vsn;
-        result.encode = (_h = options === null || options === void 0 ? void 0 : options.encode) !== null && _h !== void 0 ? _h : defaultEncode;
-        result.decode = (_j = options === null || options === void 0 ? void 0 : options.decode) !== null && _j !== void 0 ? _j : defaultDecode;
-        result.beforeReconnect = this._reconnectAuth.bind(this);
+        var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m;
+        // Set defaults
+        this.transport = (_a = options === null || options === void 0 ? void 0 : options.transport) !== null && _a !== void 0 ? _a : null;
+        this.timeout = (_b = options === null || options === void 0 ? void 0 : options.timeout) !== null && _b !== void 0 ? _b : constants_1.DEFAULT_TIMEOUT;
+        this.heartbeatIntervalMs =
+            (_c = options === null || options === void 0 ? void 0 : options.heartbeatIntervalMs) !== null && _c !== void 0 ? _c : CONNECTION_TIMEOUTS.HEARTBEAT_INTERVAL;
+        this.worker = (_d = options === null || options === void 0 ? void 0 : options.worker) !== null && _d !== void 0 ? _d : false;
+        this.accessToken = (_e = options === null || options === void 0 ? void 0 : options.accessToken) !== null && _e !== void 0 ? _e : null;
+        this.heartbeatCallback = (_f = options === null || options === void 0 ? void 0 : options.heartbeatCallback) !== null && _f !== void 0 ? _f : noop;
+        this.vsn = (_g = options === null || options === void 0 ? void 0 : options.vsn) !== null && _g !== void 0 ? _g : constants_1.DEFAULT_VSN;
+        // Handle special cases
+        if (options === null || options === void 0 ? void 0 : options.params)
+            this.params = options.params;
+        if (options === null || options === void 0 ? void 0 : options.logger)
+            this.logger = options.logger;
         if ((options === null || options === void 0 ? void 0 : options.logLevel) || (options === null || options === void 0 ? void 0 : options.log_level)) {
             this.logLevel = options.logLevel || options.log_level;
-            result.params = Object.assign(Object.assign({}, result.params), { log_level: this.logLevel });
+            this.params = Object.assign(Object.assign({}, this.params), { log_level: this.logLevel });
+        }
+        // Set up functions with defaults
+        this.reconnectAfterMs =
+            (_h = options === null || options === void 0 ? void 0 : options.reconnectAfterMs) !== null && _h !== void 0 ? _h : ((tries) => {
+                return RECONNECT_INTERVALS[tries - 1] || DEFAULT_RECONNECT_FALLBACK;
+            });
+        switch (this.vsn) {
+            case constants_1.VSN_1_0_0:
+                this.encode =
+                    (_j = options === null || options === void 0 ? void 0 : options.encode) !== null && _j !== void 0 ? _j : ((payload, callback) => {
+                        return callback(JSON.stringify(payload));
+                    });
+                this.decode =
+                    (_k = options === null || options === void 0 ? void 0 : options.decode) !== null && _k !== void 0 ? _k : ((payload, callback) => {
+                        return callback(JSON.parse(payload));
+                    });
+                break;
+            case constants_1.VSN_2_0_0:
+                this.encode = (_l = options === null || options === void 0 ? void 0 : options.encode) !== null && _l !== void 0 ? _l : this.serializer.encode.bind(this.serializer);
+                this.decode = (_m = options === null || options === void 0 ? void 0 : options.decode) !== null && _m !== void 0 ? _m : this.serializer.decode.bind(this.serializer);
+                break;
+            default:
+                throw new Error(`Unsupported serializer version: ${this.vsn}`);
         }
         // Handle worker setup
         if (this.worker) {
@@ -12927,15 +11587,6 @@ class RealtimeClient {
                 throw new Error('Web Worker is not supported');
             }
             this.workerUrl = options === null || options === void 0 ? void 0 : options.workerUrl;
-            result.autoSendHeartbeat = !this.worker;
-        }
-        return result;
-    }
-    /** @internal */
-    async _reconnectAuth() {
-        await this._waitForAuthIfNeeded();
-        if (!this.isConnected()) {
-            this.connect();
         }
     }
 }
@@ -12945,7 +11596,7 @@ exports["default"] = RealtimeClient;
 /***/ }),
 
 /***/ 5583:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+/***/ ((__unused_webpack_module, exports) => {
 
 "use strict";
 
@@ -12955,8 +11606,6 @@ exports["default"] = RealtimeClient;
 */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.REALTIME_PRESENCE_LISTEN_EVENTS = void 0;
-const tslib_1 = __nccwpck_require__(7647);
-const presenceAdapter_1 = tslib_1.__importDefault(__nccwpck_require__(9827));
 var REALTIME_PRESENCE_LISTEN_EVENTS;
 (function (REALTIME_PRESENCE_LISTEN_EVENTS) {
     REALTIME_PRESENCE_LISTEN_EVENTS["SYNC"] = "sync";
@@ -12964,9 +11613,6 @@ var REALTIME_PRESENCE_LISTEN_EVENTS;
     REALTIME_PRESENCE_LISTEN_EVENTS["LEAVE"] = "leave";
 })(REALTIME_PRESENCE_LISTEN_EVENTS || (exports.REALTIME_PRESENCE_LISTEN_EVENTS = REALTIME_PRESENCE_LISTEN_EVENTS = {}));
 class RealtimePresence {
-    get state() {
-        return this.presenceAdapter.state;
-    }
     /**
      * Creates a Presence helper that keeps the local presence state in sync with the server.
      *
@@ -12984,7 +11630,208 @@ class RealtimePresence {
      */
     constructor(channel, opts) {
         this.channel = channel;
-        this.presenceAdapter = new presenceAdapter_1.default(this.channel.channelAdapter, opts);
+        this.state = {};
+        this.pendingDiffs = [];
+        this.joinRef = null;
+        this.enabled = false;
+        this.caller = {
+            onJoin: () => { },
+            onLeave: () => { },
+            onSync: () => { },
+        };
+        const events = (opts === null || opts === void 0 ? void 0 : opts.events) || {
+            state: 'presence_state',
+            diff: 'presence_diff',
+        };
+        this.channel._on(events.state, {}, (newState) => {
+            const { onJoin, onLeave, onSync } = this.caller;
+            this.joinRef = this.channel._joinRef();
+            this.state = RealtimePresence.syncState(this.state, newState, onJoin, onLeave);
+            this.pendingDiffs.forEach((diff) => {
+                this.state = RealtimePresence.syncDiff(this.state, diff, onJoin, onLeave);
+            });
+            this.pendingDiffs = [];
+            onSync();
+        });
+        this.channel._on(events.diff, {}, (diff) => {
+            const { onJoin, onLeave, onSync } = this.caller;
+            if (this.inPendingSyncState()) {
+                this.pendingDiffs.push(diff);
+            }
+            else {
+                this.state = RealtimePresence.syncDiff(this.state, diff, onJoin, onLeave);
+                onSync();
+            }
+        });
+        this.onJoin((key, currentPresences, newPresences) => {
+            this.channel._trigger('presence', {
+                event: 'join',
+                key,
+                currentPresences,
+                newPresences,
+            });
+        });
+        this.onLeave((key, currentPresences, leftPresences) => {
+            this.channel._trigger('presence', {
+                event: 'leave',
+                key,
+                currentPresences,
+                leftPresences,
+            });
+        });
+        this.onSync(() => {
+            this.channel._trigger('presence', { event: 'sync' });
+        });
+    }
+    /**
+     * Used to sync the list of presences on the server with the
+     * client's state.
+     *
+     * An optional `onJoin` and `onLeave` callback can be provided to
+     * react to changes in the client's local presences across
+     * disconnects and reconnects with the server.
+     *
+     * @internal
+     */
+    static syncState(currentState, newState, onJoin, onLeave) {
+        const state = this.cloneDeep(currentState);
+        const transformedState = this.transformState(newState);
+        const joins = {};
+        const leaves = {};
+        this.map(state, (key, presences) => {
+            if (!transformedState[key]) {
+                leaves[key] = presences;
+            }
+        });
+        this.map(transformedState, (key, newPresences) => {
+            const currentPresences = state[key];
+            if (currentPresences) {
+                const newPresenceRefs = newPresences.map((m) => m.presence_ref);
+                const curPresenceRefs = currentPresences.map((m) => m.presence_ref);
+                const joinedPresences = newPresences.filter((m) => curPresenceRefs.indexOf(m.presence_ref) < 0);
+                const leftPresences = currentPresences.filter((m) => newPresenceRefs.indexOf(m.presence_ref) < 0);
+                if (joinedPresences.length > 0) {
+                    joins[key] = joinedPresences;
+                }
+                if (leftPresences.length > 0) {
+                    leaves[key] = leftPresences;
+                }
+            }
+            else {
+                joins[key] = newPresences;
+            }
+        });
+        return this.syncDiff(state, { joins, leaves }, onJoin, onLeave);
+    }
+    /**
+     * Used to sync a diff of presence join and leave events from the
+     * server, as they happen.
+     *
+     * Like `syncState`, `syncDiff` accepts optional `onJoin` and
+     * `onLeave` callbacks to react to a user joining or leaving from a
+     * device.
+     *
+     * @internal
+     */
+    static syncDiff(state, diff, onJoin, onLeave) {
+        const { joins, leaves } = {
+            joins: this.transformState(diff.joins),
+            leaves: this.transformState(diff.leaves),
+        };
+        if (!onJoin) {
+            onJoin = () => { };
+        }
+        if (!onLeave) {
+            onLeave = () => { };
+        }
+        this.map(joins, (key, newPresences) => {
+            var _a;
+            const currentPresences = (_a = state[key]) !== null && _a !== void 0 ? _a : [];
+            state[key] = this.cloneDeep(newPresences);
+            if (currentPresences.length > 0) {
+                const joinedPresenceRefs = state[key].map((m) => m.presence_ref);
+                const curPresences = currentPresences.filter((m) => joinedPresenceRefs.indexOf(m.presence_ref) < 0);
+                state[key].unshift(...curPresences);
+            }
+            onJoin(key, currentPresences, newPresences);
+        });
+        this.map(leaves, (key, leftPresences) => {
+            let currentPresences = state[key];
+            if (!currentPresences)
+                return;
+            const presenceRefsToRemove = leftPresences.map((m) => m.presence_ref);
+            currentPresences = currentPresences.filter((m) => presenceRefsToRemove.indexOf(m.presence_ref) < 0);
+            state[key] = currentPresences;
+            onLeave(key, currentPresences, leftPresences);
+            if (currentPresences.length === 0)
+                delete state[key];
+        });
+        return state;
+    }
+    /** @internal */
+    static map(obj, func) {
+        return Object.getOwnPropertyNames(obj).map((key) => func(key, obj[key]));
+    }
+    /**
+     * Remove 'metas' key
+     * Change 'phx_ref' to 'presence_ref'
+     * Remove 'phx_ref' and 'phx_ref_prev'
+     *
+     * @example
+     * // returns {
+     *  abc123: [
+     *    { presence_ref: '2', user_id: 1 },
+     *    { presence_ref: '3', user_id: 2 }
+     *  ]
+     * }
+     * RealtimePresence.transformState({
+     *  abc123: {
+     *    metas: [
+     *      { phx_ref: '2', phx_ref_prev: '1' user_id: 1 },
+     *      { phx_ref: '3', user_id: 2 }
+     *    ]
+     *  }
+     * })
+     *
+     * @internal
+     */
+    static transformState(state) {
+        state = this.cloneDeep(state);
+        return Object.getOwnPropertyNames(state).reduce((newState, key) => {
+            const presences = state[key];
+            if ('metas' in presences) {
+                newState[key] = presences.metas.map((presence) => {
+                    presence['presence_ref'] = presence['phx_ref'];
+                    delete presence['phx_ref'];
+                    delete presence['phx_ref_prev'];
+                    return presence;
+                });
+            }
+            else {
+                newState[key] = presences;
+            }
+            return newState;
+        }, {});
+    }
+    /** @internal */
+    static cloneDeep(obj) {
+        return JSON.parse(JSON.stringify(obj));
+    }
+    /** @internal */
+    onJoin(callback) {
+        this.caller.onJoin = callback;
+    }
+    /** @internal */
+    onLeave(callback) {
+        this.caller.onLeave = callback;
+    }
+    /** @internal */
+    onSync(callback) {
+        this.caller.onSync = callback;
+    }
+    /** @internal */
+    inPendingSyncState() {
+        return !this.joinRef || this.joinRef !== this.channel._joinRef();
     }
 }
 exports["default"] = RealtimePresence;
@@ -13034,37 +11881,151 @@ exports.VERSION = version_1.version;
 exports.DEFAULT_TIMEOUT = 10000;
 exports.WS_CLOSE_NORMAL = 1000;
 exports.MAX_PUSH_BUFFER_SIZE = 100;
-exports.SOCKET_STATES = {
-    connecting: 0,
-    open: 1,
-    closing: 2,
-    closed: 3,
-};
-exports.CHANNEL_STATES = {
-    closed: 'closed',
-    errored: 'errored',
-    joined: 'joined',
-    joining: 'joining',
-    leaving: 'leaving',
-};
-exports.CHANNEL_EVENTS = {
-    close: 'phx_close',
-    error: 'phx_error',
-    join: 'phx_join',
-    reply: 'phx_reply',
-    leave: 'phx_leave',
-    access_token: 'access_token',
-};
-exports.TRANSPORTS = {
-    websocket: 'websocket',
-};
-exports.CONNECTION_STATE = {
-    connecting: 'connecting',
-    open: 'open',
-    closing: 'closing',
-    closed: 'closed',
-};
+var SOCKET_STATES;
+(function (SOCKET_STATES) {
+    SOCKET_STATES[SOCKET_STATES["connecting"] = 0] = "connecting";
+    SOCKET_STATES[SOCKET_STATES["open"] = 1] = "open";
+    SOCKET_STATES[SOCKET_STATES["closing"] = 2] = "closing";
+    SOCKET_STATES[SOCKET_STATES["closed"] = 3] = "closed";
+})(SOCKET_STATES || (exports.SOCKET_STATES = SOCKET_STATES = {}));
+var CHANNEL_STATES;
+(function (CHANNEL_STATES) {
+    CHANNEL_STATES["closed"] = "closed";
+    CHANNEL_STATES["errored"] = "errored";
+    CHANNEL_STATES["joined"] = "joined";
+    CHANNEL_STATES["joining"] = "joining";
+    CHANNEL_STATES["leaving"] = "leaving";
+})(CHANNEL_STATES || (exports.CHANNEL_STATES = CHANNEL_STATES = {}));
+var CHANNEL_EVENTS;
+(function (CHANNEL_EVENTS) {
+    CHANNEL_EVENTS["close"] = "phx_close";
+    CHANNEL_EVENTS["error"] = "phx_error";
+    CHANNEL_EVENTS["join"] = "phx_join";
+    CHANNEL_EVENTS["reply"] = "phx_reply";
+    CHANNEL_EVENTS["leave"] = "phx_leave";
+    CHANNEL_EVENTS["access_token"] = "access_token";
+})(CHANNEL_EVENTS || (exports.CHANNEL_EVENTS = CHANNEL_EVENTS = {}));
+var TRANSPORTS;
+(function (TRANSPORTS) {
+    TRANSPORTS["websocket"] = "websocket";
+})(TRANSPORTS || (exports.TRANSPORTS = TRANSPORTS = {}));
+var CONNECTION_STATE;
+(function (CONNECTION_STATE) {
+    CONNECTION_STATE["Connecting"] = "connecting";
+    CONNECTION_STATE["Open"] = "open";
+    CONNECTION_STATE["Closing"] = "closing";
+    CONNECTION_STATE["Closed"] = "closed";
+})(CONNECTION_STATE || (exports.CONNECTION_STATE = CONNECTION_STATE = {}));
 //# sourceMappingURL=constants.js.map
+
+/***/ }),
+
+/***/ 2292:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+const constants_1 = __nccwpck_require__(88);
+class Push {
+    /**
+     * Initializes the Push
+     *
+     * @param channel The Channel
+     * @param event The event, for example `"phx_join"`
+     * @param payload The payload, for example `{user_id: 123}`
+     * @param timeout The push timeout in milliseconds
+     */
+    constructor(channel, event, payload = {}, timeout = constants_1.DEFAULT_TIMEOUT) {
+        this.channel = channel;
+        this.event = event;
+        this.payload = payload;
+        this.timeout = timeout;
+        this.sent = false;
+        this.timeoutTimer = undefined;
+        this.ref = '';
+        this.receivedResp = null;
+        this.recHooks = [];
+        this.refEvent = null;
+    }
+    resend(timeout) {
+        this.timeout = timeout;
+        this._cancelRefEvent();
+        this.ref = '';
+        this.refEvent = null;
+        this.receivedResp = null;
+        this.sent = false;
+        this.send();
+    }
+    send() {
+        if (this._hasReceived('timeout')) {
+            return;
+        }
+        this.startTimeout();
+        this.sent = true;
+        this.channel.socket.push({
+            topic: this.channel.topic,
+            event: this.event,
+            payload: this.payload,
+            ref: this.ref,
+            join_ref: this.channel._joinRef(),
+        });
+    }
+    updatePayload(payload) {
+        this.payload = Object.assign(Object.assign({}, this.payload), payload);
+    }
+    receive(status, callback) {
+        var _a;
+        if (this._hasReceived(status)) {
+            callback((_a = this.receivedResp) === null || _a === void 0 ? void 0 : _a.response);
+        }
+        this.recHooks.push({ status, callback });
+        return this;
+    }
+    startTimeout() {
+        if (this.timeoutTimer) {
+            return;
+        }
+        this.ref = this.channel.socket._makeRef();
+        this.refEvent = this.channel._replyEventName(this.ref);
+        const callback = (payload) => {
+            this._cancelRefEvent();
+            this._cancelTimeout();
+            this.receivedResp = payload;
+            this._matchReceive(payload);
+        };
+        this.channel._on(this.refEvent, {}, callback);
+        this.timeoutTimer = setTimeout(() => {
+            this.trigger('timeout', {});
+        }, this.timeout);
+    }
+    trigger(status, response) {
+        if (this.refEvent)
+            this.channel._trigger(this.refEvent, { status, response });
+    }
+    destroy() {
+        this._cancelRefEvent();
+        this._cancelTimeout();
+    }
+    _cancelRefEvent() {
+        if (!this.refEvent) {
+            return;
+        }
+        this.channel._off(this.refEvent, {});
+    }
+    _cancelTimeout() {
+        clearTimeout(this.timeoutTimer);
+        this.timeoutTimer = undefined;
+    }
+    _matchReceive({ status, response }) {
+        this.recHooks.filter((h) => h.status === status).forEach((h) => h.callback(response));
+    }
+    _hasReceived(status) {
+        return this.receivedResp && this.receivedResp.status === status;
+    }
+}
+exports["default"] = Push;
+//# sourceMappingURL=push.js.map
 
 /***/ }),
 
@@ -13227,6 +12188,52 @@ class Serializer {
 }
 exports["default"] = Serializer;
 //# sourceMappingURL=serializer.js.map
+
+/***/ }),
+
+/***/ 2983:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+/**
+ * Creates a timer that accepts a `timerCalc` function to perform calculated timeout retries, such as exponential backoff.
+ *
+ * @example
+ *    let reconnectTimer = new Timer(() => this.connect(), function(tries){
+ *      return [1000, 5000, 10000][tries - 1] || 10000
+ *    })
+ *    reconnectTimer.scheduleTimeout() // fires after 1000
+ *    reconnectTimer.scheduleTimeout() // fires after 5000
+ *    reconnectTimer.reset()
+ *    reconnectTimer.scheduleTimeout() // fires after 1000
+ */
+class Timer {
+    constructor(callback, timerCalc) {
+        this.callback = callback;
+        this.timerCalc = timerCalc;
+        this.timer = undefined;
+        this.tries = 0;
+        this.callback = callback;
+        this.timerCalc = timerCalc;
+    }
+    reset() {
+        this.tries = 0;
+        clearTimeout(this.timer);
+        this.timer = undefined;
+    }
+    // Cancels any previous scheduleTimeout and schedules callback
+    scheduleTimeout() {
+        clearTimeout(this.timer);
+        this.timer = setTimeout(() => {
+            this.tries = this.tries + 1;
+            this.callback();
+        }, this.timerCalc(this.tries + 1));
+    }
+}
+exports["default"] = Timer;
+//# sourceMappingURL=timer.js.map
 
 /***/ }),
 
@@ -13491,7 +12498,7 @@ exports.version = void 0;
 // - Debugging and support (identifying which version is running)
 // - Telemetry and logging (version reporting in errors/analytics)
 // - Ensuring build artifacts match the published package version
-exports.version = '2.100.0-canary.0';
+exports.version = '2.99.3';
 //# sourceMappingURL=version.js.map
 
 /***/ }),
@@ -13597,6 +12604,18 @@ class WebSocketFactory {
         throw new Error(errorMessage);
     }
     /**
+     * Creates a WebSocket using the detected constructor.
+     *
+     * @example
+     * ```ts
+     * const socket = WebSocketFactory.createWebSocket('wss://realtime.supabase.co/socket')
+     * ```
+     */
+    static createWebSocket(url, protocols) {
+        const WS = this.getWebSocketConstructor();
+        return new WS(url, protocols);
+    }
+    /**
      * Detects whether the runtime can establish WebSocket connections.
      *
      * @example
@@ -13619,337 +12638,6 @@ class WebSocketFactory {
 exports.WebSocketFactory = WebSocketFactory;
 exports["default"] = WebSocketFactory;
 //# sourceMappingURL=websocket-factory.js.map
-
-/***/ }),
-
-/***/ 6257:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-const constants_1 = __nccwpck_require__(88);
-class ChannelAdapter {
-    constructor(socket, topic, params) {
-        const phoenixParams = phoenixChannelParams(params);
-        this.channel = socket.getSocket().channel(topic, phoenixParams);
-        this.socket = socket;
-    }
-    get state() {
-        return this.channel.state;
-    }
-    set state(state) {
-        this.channel.state = state;
-    }
-    get joinedOnce() {
-        return this.channel.joinedOnce;
-    }
-    get joinPush() {
-        return this.channel.joinPush;
-    }
-    get rejoinTimer() {
-        return this.channel.rejoinTimer;
-    }
-    on(event, callback) {
-        return this.channel.on(event, callback);
-    }
-    off(event, refNumber) {
-        this.channel.off(event, refNumber);
-    }
-    subscribe(timeout) {
-        return this.channel.join(timeout);
-    }
-    unsubscribe(timeout) {
-        return this.channel.leave(timeout);
-    }
-    teardown() {
-        this.channel.teardown();
-    }
-    onClose(callback) {
-        this.channel.onClose(callback);
-    }
-    onError(callback) {
-        return this.channel.onError(callback);
-    }
-    push(event, payload, timeout) {
-        let push;
-        try {
-            push = this.channel.push(event, payload, timeout);
-        }
-        catch (error) {
-            throw `tried to push '${event}' to '${this.channel.topic}' before joining. Use channel.subscribe() before pushing events`;
-        }
-        if (this.channel.pushBuffer.length > constants_1.MAX_PUSH_BUFFER_SIZE) {
-            const removedPush = this.channel.pushBuffer.shift();
-            removedPush.cancelTimeout();
-            this.socket.log('channel', `discarded push due to buffer overflow: ${removedPush.event}`, removedPush.payload());
-        }
-        return push;
-    }
-    updateJoinPayload(payload) {
-        const oldPayload = this.channel.joinPush.payload();
-        this.channel.joinPush.payload = () => (Object.assign(Object.assign({}, oldPayload), payload));
-    }
-    canPush() {
-        return this.socket.isConnected() && this.state === constants_1.CHANNEL_STATES.joined;
-    }
-    isJoined() {
-        return this.state === constants_1.CHANNEL_STATES.joined;
-    }
-    isJoining() {
-        return this.state === constants_1.CHANNEL_STATES.joining;
-    }
-    isClosed() {
-        return this.state === constants_1.CHANNEL_STATES.closed;
-    }
-    isLeaving() {
-        return this.state === constants_1.CHANNEL_STATES.leaving;
-    }
-    updateFilterBindings(filterBindings) {
-        this.channel.filterBindings = filterBindings;
-    }
-    updatePayloadTransform(callback) {
-        this.channel.onMessage = callback;
-    }
-    /**
-     * @internal
-     */
-    getChannel() {
-        return this.channel;
-    }
-}
-exports["default"] = ChannelAdapter;
-function phoenixChannelParams(options) {
-    return {
-        config: Object.assign({
-            broadcast: { ack: false, self: false },
-            presence: { key: '', enabled: false },
-            private: false,
-        }, options.config),
-    };
-}
-//# sourceMappingURL=channelAdapter.js.map
-
-/***/ }),
-
-/***/ 9827:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-const phoenix_1 = __nccwpck_require__(3513);
-class PresenceAdapter {
-    constructor(channel, opts) {
-        const phoenixOptions = phoenixPresenceOptions(opts);
-        this.presence = new phoenix_1.Presence(channel.getChannel(), phoenixOptions);
-        this.presence.onJoin((key, currentPresence, newPresence) => {
-            const onJoinPayload = PresenceAdapter.onJoinPayload(key, currentPresence, newPresence);
-            channel.getChannel().trigger('presence', onJoinPayload);
-        });
-        this.presence.onLeave((key, currentPresence, leftPresence) => {
-            const onLeavePayload = PresenceAdapter.onLeavePayload(key, currentPresence, leftPresence);
-            channel.getChannel().trigger('presence', onLeavePayload);
-        });
-        this.presence.onSync(() => {
-            channel.getChannel().trigger('presence', { event: 'sync' });
-        });
-    }
-    get state() {
-        return PresenceAdapter.transformState(this.presence.state);
-    }
-    /**
-     * @private
-     * Remove 'metas' key
-     * Change 'phx_ref' to 'presence_ref'
-     * Remove 'phx_ref' and 'phx_ref_prev'
-     *
-     * @example
-     * // returns {
-     *  abc123: [
-     *    { presence_ref: '2', user_id: 1 },
-     *    { presence_ref: '3', user_id: 2 }
-     *  ]
-     * }
-     * RealtimePresence.transformState({
-     *  abc123: {
-     *    metas: [
-     *      { phx_ref: '2', phx_ref_prev: '1' user_id: 1 },
-     *      { phx_ref: '3', user_id: 2 }
-     *    ]
-     *  }
-     * })
-     *
-     */
-    static transformState(state) {
-        state = cloneState(state);
-        return Object.getOwnPropertyNames(state).reduce((newState, key) => {
-            const presences = state[key];
-            newState[key] = transformState(presences);
-            return newState;
-        }, {});
-    }
-    static onJoinPayload(key, currentPresence, newPresence) {
-        const currentPresences = parseCurrentPresences(currentPresence);
-        const newPresences = transformState(newPresence);
-        return {
-            event: 'join',
-            key,
-            currentPresences,
-            newPresences,
-        };
-    }
-    static onLeavePayload(key, currentPresence, leftPresence) {
-        const currentPresences = parseCurrentPresences(currentPresence);
-        const leftPresences = transformState(leftPresence);
-        return {
-            event: 'leave',
-            key,
-            currentPresences,
-            leftPresences,
-        };
-    }
-}
-exports["default"] = PresenceAdapter;
-function transformState(presences) {
-    return presences.metas.map((presence) => {
-        presence['presence_ref'] = presence['phx_ref'];
-        delete presence['phx_ref'];
-        delete presence['phx_ref_prev'];
-        return presence;
-    });
-}
-function cloneState(state) {
-    return JSON.parse(JSON.stringify(state));
-}
-function phoenixPresenceOptions(opts) {
-    return (opts === null || opts === void 0 ? void 0 : opts.events) && { events: opts.events };
-}
-function parseCurrentPresences(currentPresences) {
-    return (currentPresences === null || currentPresences === void 0 ? void 0 : currentPresences.metas) ? transformState(currentPresences) : [];
-}
-//# sourceMappingURL=presenceAdapter.js.map
-
-/***/ }),
-
-/***/ 8397:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-const phoenix_1 = __nccwpck_require__(3513);
-const constants_1 = __nccwpck_require__(88);
-class SocketAdapter {
-    constructor(endPoint, options) {
-        this.socket = new phoenix_1.Socket(endPoint, options);
-    }
-    get timeout() {
-        return this.socket.timeout;
-    }
-    get endPoint() {
-        return this.socket.endPoint;
-    }
-    get transport() {
-        return this.socket.transport;
-    }
-    get heartbeatIntervalMs() {
-        return this.socket.heartbeatIntervalMs;
-    }
-    get heartbeatCallback() {
-        return this.socket.heartbeatCallback;
-    }
-    set heartbeatCallback(callback) {
-        this.socket.heartbeatCallback = callback;
-    }
-    get heartbeatTimer() {
-        return this.socket.heartbeatTimer;
-    }
-    get pendingHeartbeatRef() {
-        return this.socket.pendingHeartbeatRef;
-    }
-    get reconnectTimer() {
-        return this.socket.reconnectTimer;
-    }
-    get vsn() {
-        return this.socket.vsn;
-    }
-    get encode() {
-        return this.socket.encode;
-    }
-    get decode() {
-        return this.socket.decode;
-    }
-    get reconnectAfterMs() {
-        return this.socket.reconnectAfterMs;
-    }
-    get sendBuffer() {
-        return this.socket.sendBuffer;
-    }
-    get stateChangeCallbacks() {
-        return this.socket.stateChangeCallbacks;
-    }
-    connect() {
-        this.socket.connect();
-    }
-    disconnect(callback, code, reason, timeout = 10000) {
-        return new Promise((resolve) => {
-            setTimeout(() => resolve('timeout'), timeout);
-            this.socket.disconnect(() => {
-                callback();
-                resolve('ok');
-            }, code, reason);
-        });
-    }
-    push(data) {
-        this.socket.push(data);
-    }
-    log(kind, msg, data) {
-        this.socket.log(kind, msg, data);
-    }
-    makeRef() {
-        return this.socket.makeRef();
-    }
-    onOpen(callback) {
-        this.socket.onOpen(callback);
-    }
-    onClose(callback) {
-        this.socket.onClose(callback);
-    }
-    onError(callback) {
-        this.socket.onError(callback);
-    }
-    onMessage(callback) {
-        this.socket.onMessage(callback);
-    }
-    isConnected() {
-        return this.socket.isConnected();
-    }
-    isConnecting() {
-        return this.socket.connectionState() == constants_1.CONNECTION_STATE.connecting;
-    }
-    isDisconnecting() {
-        return this.socket.connectionState() == constants_1.CONNECTION_STATE.closing;
-    }
-    connectionState() {
-        // @ts-ignore - requires better typing and exposing type in phoenix
-        return this.socket.connectionState();
-    }
-    endPointURL() {
-        return this.socket.endPointURL();
-    }
-    sendHeartbeat() {
-        this.socket.sendHeartbeat();
-    }
-    /**
-     * @internal
-     */
-    getSocket() {
-        return this.socket;
-    }
-}
-exports["default"] = SocketAdapter;
-//# sourceMappingURL=socketAdapter.js.map
 
 /***/ }),
 
@@ -30196,7 +28884,19 @@ var PostgrestBuilder = class {
 	*
 	* @example
 	* ```ts
-	* import PostgrestQueryBuilder from '@supabase/postgrest-js'
+	* import { PostgrestQueryBuilder } from '@supabase/postgrest-js'
+	*
+	* const builder = new PostgrestQueryBuilder(
+	*   new URL('https://xyzcompany.supabase.co/rest/v1/users'),
+	*   { headers: new Headers({ apikey: 'public-anon-key' }) }
+	* )
+	* ```
+	*
+	* @category Database
+	*
+	* @example Example 1
+	* ```ts
+	* import { PostgrestQueryBuilder } from '@supabase/postgrest-js'
 	*
 	* const builder = new PostgrestQueryBuilder(
 	*   new URL('https://xyzcompany.supabase.co/rest/v1/users'),
@@ -30224,6 +28924,8 @@ var PostgrestBuilder = class {
 	* throwing the error instead of returning it as part of a successful response.
 	*
 	* {@link https://github.com/supabase/supabase-js/issues/92}
+	*
+	* @category Database
 	*/
 	throwOnError() {
 		this.shouldThrowOnError = true;
@@ -30231,12 +28933,17 @@ var PostgrestBuilder = class {
 	}
 	/**
 	* Set an HTTP header for the request.
+	*
+	* @category Database
 	*/
 	setHeader(name, value) {
 		this.headers = new Headers(this.headers);
 		this.headers.set(name, value);
 		return this;
 	}
+	/**  *
+	* @category Database
+	*/
 	then(onfulfilled, onrejected) {
 		var _this = this;
 		if (this.schema === void 0) {} else if (["GET", "HEAD"].includes(this.method)) this.headers.set("Accept-Profile", this.schema);
@@ -30359,6 +29066,8 @@ var PostgrestBuilder = class {
 	*
 	* @typeParam NewResult - The new result type to override with
 	* @deprecated Use overrideTypes<yourType, { merge: false }>() method at the end of your call chain instead
+	*
+	* @category Database
 	*/
 	returns() {
 		/* istanbul ignore next */
@@ -30385,6 +29094,77 @@ var PostgrestBuilder = class {
 	*   .overrideTypes<{ id: number; name: string }, { merge: false }>()
 	* ```
 	* @returns A PostgrestBuilder instance with the new type
+	*
+	* @category Database
+	*
+	* @example Complete Override type of successful response
+	* ```ts
+	* const { data } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .overrideTypes<Array<MyType>, { merge: false }>()
+	* ```
+	*
+	* @exampleResponse Complete Override type of successful response
+	* ```ts
+	* let x: typeof data // MyType[]
+	* ```
+	*
+	* @example Complete Override type of object response
+	* ```ts
+	* const { data } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .maybeSingle()
+	*   .overrideTypes<MyType, { merge: false }>()
+	* ```
+	*
+	* @exampleResponse Complete Override type of object response
+	* ```ts
+	* let x: typeof data // MyType | null
+	* ```
+	*
+	* @example Partial Override type of successful response
+	* ```ts
+	* const { data } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .overrideTypes<Array<{ status: "A" | "B" }>>()
+	* ```
+	*
+	* @exampleResponse Partial Override type of successful response
+	* ```ts
+	* let x: typeof data // Array<CountryRowProperties & { status: "A" | "B" }>
+	* ```
+	*
+	* @example Partial Override type of object response
+	* ```ts
+	* const { data } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .maybeSingle()
+	*   .overrideTypes<{ status: "A" | "B" }>()
+	* ```
+	*
+	* @exampleResponse Partial Override type of object response
+	* ```ts
+	* let x: typeof data // CountryRowProperties & { status: "A" | "B" } | null
+	* ```
+	*
+	* @example Example 5
+	* ```typescript
+	* // Merge with existing types (default behavior)
+	* const query = supabase
+	*   .from('users')
+	*   .select()
+	*   .overrideTypes<{ custom_field: string }>()
+	*
+	* // Replace existing types completely
+	* const replaceQuery = supabase
+	*   .from('users')
+	*   .select()
+	*   .overrideTypes<{ id: number; name: string }, { merge: false }>()
+	* ```
 	*/
 	overrideTypes() {
 		return this;
@@ -30402,6 +29182,41 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* `data`.
 	*
 	* @param columns - The columns to retrieve, separated by commas
+	*
+	* @category Database
+	*
+	* @example With `upsert()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .upsert({ id: 1, name: 'Han Solo' })
+	*   .select()
+	* ```
+	*
+	* @exampleSql With `upsert()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Han');
+	* ```
+	*
+	* @exampleResponse With `upsert()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Han Solo"
+	*     }
+	*   ],
+	*   "status": 201,
+	*   "statusText": "Created"
+	* }
+	* ```
 	*/
 	select(columns) {
 		let quoted = false;
@@ -30431,6 +29246,176 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* its columns
 	* @param options.foreignTable - Deprecated, use `options.referencedTable`
 	* instead
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('id, name')
+	*   .order('id', { ascending: false })
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 3,
+	*       "name": "Han"
+	*     },
+	*     {
+	*       "id": 2,
+	*       "name": "Leia"
+	*     },
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription On a referenced table
+	* Ordering with `referencedTable` doesn't affect the ordering of the
+	* parent table.
+	*
+	* @example On a referenced table
+	* ```ts
+	*   const { data, error } = await supabase
+	*     .from('orchestral_sections')
+	*     .select(`
+	*       name,
+	*       instruments (
+	*         name
+	*       )
+	*     `)
+	*     .order('name', { referencedTable: 'instruments', ascending: false })
+	*
+	* ```
+	*
+	* @exampleSql On a referenced table
+	* ```sql
+	* create table
+	*   orchestral_sections (id int8 primary key, name text);
+	* create table
+	*   instruments (
+	*     id int8 primary key,
+	*     section_id int8 not null references orchestral_sections,
+	*     name text
+	*   );
+	*
+	* insert into
+	*   orchestral_sections (id, name)
+	* values
+	*   (1, 'strings'),
+	*   (2, 'woodwinds');
+	* insert into
+	*   instruments (id, section_id, name)
+	* values
+	*   (1, 1, 'harp'),
+	*   (2, 1, 'violin');
+	* ```
+	*
+	* @exampleResponse On a referenced table
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "strings",
+	*       "instruments": [
+	*         {
+	*           "name": "violin"
+	*         },
+	*         {
+	*           "name": "harp"
+	*         }
+	*       ]
+	*     },
+	*     {
+	*       "name": "woodwinds",
+	*       "instruments": []
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription Order parent table by a referenced table
+	* Ordering with `referenced_table(col)` affects the ordering of the
+	* parent table.
+	*
+	* @example Order parent table by a referenced table
+	* ```ts
+	*   const { data, error } = await supabase
+	*     .from('instruments')
+	*     .select(`
+	*       name,
+	*       section:orchestral_sections (
+	*         name
+	*       )
+	*     `)
+	*     .order('section(name)', { ascending: true })
+	*
+	* ```
+	*
+	* @exampleSql Order parent table by a referenced table
+	* ```sql
+	* create table
+	*   orchestral_sections (id int8 primary key, name text);
+	* create table
+	*   instruments (
+	*     id int8 primary key,
+	*     section_id int8 not null references orchestral_sections,
+	*     name text
+	*   );
+	*
+	* insert into
+	*   orchestral_sections (id, name)
+	* values
+	*   (1, 'strings'),
+	*   (2, 'woodwinds');
+	* insert into
+	*   instruments (id, section_id, name)
+	* values
+	*   (1, 2, 'flute'),
+	*   (2, 1, 'violin');
+	* ```
+	*
+	* @exampleResponse Order parent table by a referenced table
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "violin",
+	*       "orchestral_sections": {"name": "strings"}
+	*     },
+	*     {
+	*       "name": "flute",
+	*       "orchestral_sections": {"name": "woodwinds"}
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	order(column, { ascending = true, nullsFirst, foreignTable, referencedTable = foreignTable } = {}) {
 		const key = referencedTable ? `${referencedTable}.order` : "order";
@@ -30447,6 +29432,95 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* tables instead of the parent table
 	* @param options.foreignTable - Deprecated, use `options.referencedTable`
 	* instead
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('name')
+	*   .limit(1)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Luke"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example On a referenced table
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('orchestral_sections')
+	*   .select(`
+	*     name,
+	*     instruments (
+	*       name
+	*     )
+	*   `)
+	*   .limit(1, { referencedTable: 'instruments' })
+	* ```
+	*
+	* @exampleSql On a referenced table
+	* ```sql
+	* create table
+	*   orchestral_sections (id int8 primary key, name text);
+	* create table
+	*   instruments (
+	*     id int8 primary key,
+	*     section_id int8 not null references orchestral_sections,
+	*     name text
+	*   );
+	*
+	* insert into
+	*   orchestral_sections (id, name)
+	* values
+	*   (1, 'strings');
+	* insert into
+	*   instruments (id, section_id, name)
+	* values
+	*   (1, 1, 'harp'),
+	*   (2, 1, 'violin');
+	* ```
+	*
+	* @exampleResponse On a referenced table
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "strings",
+	*       "instruments": [
+	*         {
+	*           "name": "violin"
+	*         }
+	*       ]
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	limit(count, { foreignTable, referencedTable = foreignTable } = {}) {
 		const key = typeof referencedTable === "undefined" ? "limit" : `${referencedTable}.limit`;
@@ -30467,6 +29541,45 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* tables instead of the parent table
 	* @param options.foreignTable - Deprecated, use `options.referencedTable`
 	* instead
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('name')
+	*   .range(0, 1)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Luke"
+	*     },
+	*     {
+	*       "name": "Leia"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	range(from, to, { foreignTable, referencedTable = foreignTable } = {}) {
 		const keyOffset = typeof referencedTable === "undefined" ? "offset" : `${referencedTable}.offset`;
@@ -30479,6 +29592,66 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* Set the AbortSignal for the fetch request.
 	*
 	* @param signal - The AbortSignal to use for the fetch request
+	*
+	* @category Database
+	*
+	* @remarks
+	* You can use this to set a timeout for the request.
+	*
+	* @exampleDescription Aborting requests in-flight
+	* You can use an [`AbortController`](https://developer.mozilla.org/en-US/docs/Web/API/AbortController) to abort requests.
+	* Note that `status` and `statusText` don't mean anything for aborted requests as the request wasn't fulfilled.
+	*
+	* @example Aborting requests in-flight
+	* ```ts
+	* const ac = new AbortController()
+	*
+	* const { data, error } = await supabase
+	*   .from('very_big_table')
+	*   .select()
+	*   .abortSignal(ac.signal)
+	*
+	* // Abort the request after 100 ms
+	* setTimeout(() => ac.abort(), 100)
+	* ```
+	*
+	* @exampleResponse Aborting requests in-flight
+	* ```json
+	*   {
+	*     "error": {
+	*       "message": "AbortError: The user aborted a request.",
+	*       "details": "",
+	*       "hint": "The request was aborted locally via the provided AbortSignal.",
+	*       "code": ""
+	*     },
+	*     "status": 0,
+	*     "statusText": ""
+	*   }
+	*
+	* ```
+	*
+	* @example Set a timeout
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('very_big_table')
+	*   .select()
+	*   .abortSignal(AbortSignal.timeout(1000 /* ms *\/))
+	* ```
+	*
+	* @exampleResponse Set a timeout
+	* ```json
+	*   {
+	*     "error": {
+	*       "message": "FetchError: The user aborted a request.",
+	*       "details": "",
+	*       "hint": "",
+	*       "code": ""
+	*     },
+	*     "status": 400,
+	*     "statusText": "Bad Request"
+	*   }
+	*
+	* ```
 	*/
 	abortSignal(signal) {
 		this.signal = signal;
@@ -30489,6 +29662,41 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	*
 	* Query result must be one row (e.g. using `.limit(1)`), otherwise this
 	* returns an error.
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('name')
+	*   .limit(1)
+	*   .single()
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": {
+	*     "name": "Luke"
+	*   },
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	single() {
 		this.headers.set("Accept", "application/vnd.pgrst.object+json");
@@ -30499,6 +29707,38 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	*
 	* Query result must be zero or one row (e.g. using `.limit(1)`), otherwise
 	* this returns an error.
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .eq('name', 'Katniss')
+	*   .maybeSingle()
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	maybeSingle() {
 		if (this.method === "GET") this.headers.set("Accept", "application/json");
@@ -30508,6 +29748,41 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	}
 	/**
 	* Return `data` as a string in CSV format.
+	*
+	* @category Database
+	*
+	* @exampleDescription Return data as CSV
+	* By default, the data is returned in JSON format, but can also be returned as Comma Separated Values.
+	*
+	* @example Return data as CSV
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .csv()
+	* ```
+	*
+	* @exampleSql Return data as CSV
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse Return data as CSV
+	* ```json
+	* {
+	*   "data": "id,name\n1,Luke\n2,Leia\n3,Han",
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	csv() {
 		this.headers.set("Accept", "text/csv");
@@ -30515,6 +29790,8 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	}
 	/**
 	* Return `data` as an object in [GeoJSON](https://geojson.org) format.
+	*
+	* @category Database
 	*/
 	geojson() {
 		this.headers.set("Accept", "application/geo+json");
@@ -30544,6 +29821,76 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	*
 	* @param options.format - The format of the output, can be `"text"` (default)
 	* or `"json"`
+	*
+	* @category Database
+	*
+	* @exampleDescription Get the execution plan
+	* By default, the data is returned in TEXT format, but can also be returned as JSON by using the `format` parameter.
+	*
+	* @example Get the execution plan
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .explain()
+	* ```
+	*
+	* @exampleSql Get the execution plan
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse Get the execution plan
+	* ```js
+	* Aggregate  (cost=33.34..33.36 rows=1 width=112)
+	*   ->  Limit  (cost=0.00..18.33 rows=1000 width=40)
+	*         ->  Seq Scan on characters  (cost=0.00..22.00 rows=1200 width=40)
+	* ```
+	*
+	* @exampleDescription Get the execution plan with analyze and verbose
+	* By default, the data is returned in TEXT format, but can also be returned as JSON by using the `format` parameter.
+	*
+	* @example Get the execution plan with analyze and verbose
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .explain({analyze:true,verbose:true})
+	* ```
+	*
+	* @exampleSql Get the execution plan with analyze and verbose
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse Get the execution plan with analyze and verbose
+	* ```js
+	* Aggregate  (cost=33.34..33.36 rows=1 width=112) (actual time=0.041..0.041 rows=1 loops=1)
+	*   Output: NULL::bigint, count(ROW(characters.id, characters.name)), COALESCE(json_agg(ROW(characters.id, characters.name)), '[]'::json), NULLIF(current_setting('response.headers'::text, true), ''::text), NULLIF(current_setting('response.status'::text, true), ''::text)
+	*   ->  Limit  (cost=0.00..18.33 rows=1000 width=40) (actual time=0.005..0.006 rows=3 loops=1)
+	*         Output: characters.id, characters.name
+	*         ->  Seq Scan on public.characters  (cost=0.00..22.00 rows=1200 width=40) (actual time=0.004..0.005 rows=3 loops=1)
+	*               Output: characters.id, characters.name
+	* Query Identifier: -4730654291623321173
+	* Planning Time: 0.407 ms
+	* Execution Time: 0.119 ms
+	* ```
 	*/
 	explain({ analyze = false, verbose = false, settings = false, buffers = false, wal = false, format = "text" } = {}) {
 		var _this$headers$get;
@@ -30563,6 +29910,8 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* Rollback the query.
 	*
 	* `data` will still be returned, but the query is not committed.
+	*
+	* @category Database
 	*/
 	rollback() {
 		this.headers.append("Prefer", "tx=rollback");
@@ -30573,6 +29922,38 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	*
 	* @typeParam NewResult - The new result type to override with
 	* @deprecated Use overrideTypes<yourType, { merge: false }>() method at the end of your call chain instead
+	*
+	* @category Database
+	*
+	* @remarks
+	* - Deprecated: use overrideTypes method instead
+	*
+	* @example Override type of successful response
+	* ```ts
+	* const { data } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .returns<Array<MyType>>()
+	* ```
+	*
+	* @exampleResponse Override type of successful response
+	* ```js
+	* let x: typeof data // MyType[]
+	* ```
+	*
+	* @example Override type of object response
+	* ```ts
+	* const { data } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .maybeSingle()
+	*   .returns<MyType>()
+	* ```
+	*
+	* @exampleResponse Override type of object response
+	* ```js
+	* let x: typeof data // MyType | null
+	* ```
 	*/
 	returns() {
 		return this;
@@ -30582,6 +29963,8 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* Only available in PostgREST v13+ and only works with PATCH and DELETE methods.
 	*
 	* @param value - The maximum number of rows that can be affected
+	*
+	* @category Database
 	*/
 	maxAffected(value) {
 		this.headers.append("Prefer", "handling=strict");
@@ -30601,6 +29984,43 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .eq('name', 'Leia')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 2,
+	*       "name": "Leia"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	eq(column, value) {
 		this.url.searchParams.append(column, `eq.${value}`);
@@ -30611,6 +30031,47 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .neq('name', 'Leia')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     },
+	*     {
+	*       "id": 3,
+	*       "name": "Han"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	neq(column, value) {
 		this.url.searchParams.append(column, `neq.${value}`);
@@ -30621,6 +30082,47 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription With `select()`
+	* When using [reserved words](https://www.postgresql.org/docs/current/sql-keywords-appendix.html) for column names you need
+	* to add double quotes e.g. `.gt('"order"', 2)`
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .gt('id', 2)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 3,
+	*       "name": "Han"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	gt(column, value) {
 		this.url.searchParams.append(column, `gt.${value}`);
@@ -30631,6 +30133,47 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .gte('id', 2)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 2,
+	*       "name": "Leia"
+	*     },
+	*     {
+	*       "id": 3,
+	*       "name": "Han"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	gte(column, value) {
 		this.url.searchParams.append(column, `gte.${value}`);
@@ -30641,6 +30184,43 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .lt('id', 2)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	lt(column, value) {
 		this.url.searchParams.append(column, `lt.${value}`);
@@ -30651,6 +30231,47 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .lte('id', 2)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     },
+	*     {
+	*       "id": 2,
+	*       "name": "Leia"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	lte(column, value) {
 		this.url.searchParams.append(column, `lte.${value}`);
@@ -30661,6 +30282,43 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param pattern - The pattern to match with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .like('name', '%Lu%')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	like(column, pattern) {
 		this.url.searchParams.append(column, `like.${pattern}`);
@@ -30671,6 +30329,8 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param patterns - The patterns to match with
+	*
+	* @category Database
 	*/
 	likeAllOf(column, patterns) {
 		this.url.searchParams.append(column, `like(all).{${patterns.join(",")}}`);
@@ -30681,6 +30341,8 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param patterns - The patterns to match with
+	*
+	* @category Database
 	*/
 	likeAnyOf(column, patterns) {
 		this.url.searchParams.append(column, `like(any).{${patterns.join(",")}}`);
@@ -30691,6 +30353,43 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param pattern - The pattern to match with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .ilike('name', '%lu%')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	ilike(column, pattern) {
 		this.url.searchParams.append(column, `ilike.${pattern}`);
@@ -30701,6 +30400,8 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param patterns - The patterns to match with
+	*
+	* @category Database
 	*/
 	ilikeAllOf(column, patterns) {
 		this.url.searchParams.append(column, `ilike(all).{${patterns.join(",")}}`);
@@ -30711,6 +30412,8 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param patterns - The patterns to match with
+	*
+	* @category Database
 	*/
 	ilikeAnyOf(column, patterns) {
 		this.url.searchParams.append(column, `ilike(any).{${patterns.join(",")}}`);
@@ -30749,6 +30452,47 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription Checking for nullness, true or false
+	* Using the `eq()` filter doesn't work when filtering for `null`.
+	*
+	* Instead, you need to use `is()`.
+	*
+	* @example Checking for nullness, true or false
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .is('name', null)
+	* ```
+	*
+	* @exampleSql Checking for nullness, true or false
+	* ```sql
+	* create table
+	*   countries (id int8 primary key, name text);
+	*
+	* insert into
+	*   countries (id, name)
+	* values
+	*   (1, 'null'),
+	*   (2, null);
+	* ```
+	*
+	* @exampleResponse Checking for nullness, true or false
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 2,
+	*       "name": "null"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	is(column, value) {
 		this.url.searchParams.append(column, `is.${value}`);
@@ -30773,6 +30517,47 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param values - The values array to filter with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .in('name', ['Leia', 'Han'])
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 2,
+	*       "name": "Leia"
+	*     },
+	*     {
+	*       "id": 3,
+	*       "name": "Han"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	in(column, values) {
 		const cleanedValues = Array.from(new Set(values)).map((s) => {
@@ -30802,6 +30587,127 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The jsonb, array, or range column to filter on
 	* @param value - The jsonb, array, or range value to filter with
+	*
+	* @category Database
+	*
+	* @example On array columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('issues')
+	*   .select()
+	*   .contains('tags', ['is:open', 'priority:low'])
+	* ```
+	*
+	* @exampleSql On array columns
+	* ```sql
+	* create table
+	*   issues (
+	*     id int8 primary key,
+	*     title text,
+	*     tags text[]
+	*   );
+	*
+	* insert into
+	*   issues (id, title, tags)
+	* values
+	*   (1, 'Cache invalidation is not working', array['is:open', 'severity:high', 'priority:low']),
+	*   (2, 'Use better names', array['is:open', 'severity:low', 'priority:medium']);
+	* ```
+	*
+	* @exampleResponse On array columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "title": "Cache invalidation is not working"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription On range columns
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example On range columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .contains('during', '[2000-01-01 13:00, 2000-01-01 13:30)')
+	* ```
+	*
+	* @exampleSql On range columns
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse On range columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "room_name": "Emerald",
+	*       "during": "[\"2000-01-01 13:00:00\",\"2000-01-01 15:00:00\")"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example On `jsonb` columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('users')
+	*   .select('name')
+	*   .contains('address', { postcode: 90210 })
+	* ```
+	*
+	* @exampleSql On `jsonb` columns
+	* ```sql
+	* create table
+	*   users (
+	*     id int8 primary key,
+	*     name text,
+	*     address jsonb
+	*   );
+	*
+	* insert into
+	*   users (id, name, address)
+	* values
+	*   (1, 'Michael', '{ "postcode": 90210, "street": "Melrose Place" }'),
+	*   (2, 'Jane', '{}');
+	* ```
+	*
+	* @exampleResponse On `jsonb` columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Michael"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	contains(column, value) {
 		if (typeof value === "string") this.url.searchParams.append(column, `cs.${value}`);
@@ -30815,6 +30721,128 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The jsonb, array, or range column to filter on
 	* @param value - The jsonb, array, or range value to filter with
+	*
+	* @category Database
+	*
+	* @example On array columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('classes')
+	*   .select('name')
+	*   .containedBy('days', ['monday', 'tuesday', 'wednesday', 'friday'])
+	* ```
+	*
+	* @exampleSql On array columns
+	* ```sql
+	* create table
+	*   classes (
+	*     id int8 primary key,
+	*     name text,
+	*     days text[]
+	*   );
+	*
+	* insert into
+	*   classes (id, name, days)
+	* values
+	*   (1, 'Chemistry', array['monday', 'friday']),
+	*   (2, 'History', array['monday', 'wednesday', 'thursday']);
+	* ```
+	*
+	* @exampleResponse On array columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Chemistry"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription On range columns
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example On range columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .containedBy('during', '[2000-01-01 00:00, 2000-01-01 23:59)')
+	* ```
+	*
+	* @exampleSql On range columns
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse On range columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "room_name": "Emerald",
+	*       "during": "[\"2000-01-01 13:00:00\",\"2000-01-01 15:00:00\")"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example On `jsonb` columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('users')
+	*   .select('name')
+	*   .containedBy('address', {})
+	* ```
+	*
+	* @exampleSql On `jsonb` columns
+	* ```sql
+	* create table
+	*   users (
+	*     id int8 primary key,
+	*     name text,
+	*     address jsonb
+	*   );
+	*
+	* insert into
+	*   users (id, name, address)
+	* values
+	*   (1, 'Michael', '{ "postcode": 90210, "street": "Melrose Place" }'),
+	*   (2, 'Jane', '{}');
+	* ```
+	*
+	* @exampleResponse On `jsonb` columns
+	* ```json
+	*   {
+	*     "data": [
+	*       {
+	*         "name": "Jane"
+	*       }
+	*     ],
+	*     "status": 200,
+	*     "statusText": "OK"
+	*   }
+	*
+	* ```
 	*/
 	containedBy(column, value) {
 		if (typeof value === "string") this.url.searchParams.append(column, `cd.${value}`);
@@ -30828,6 +30856,54 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The range column to filter on
 	* @param range - The range to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription With `select()`
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .rangeGt('during', '[2000-01-02 08:00, 2000-01-02 09:00)')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	*   {
+	*     "data": [
+	*       {
+	*         "id": 2,
+	*         "room_name": "Topaz",
+	*         "during": "[\"2000-01-02 09:00:00\",\"2000-01-02 10:00:00\")"
+	*       }
+	*     ],
+	*     "status": 200,
+	*     "statusText": "OK"
+	*   }
+	*
+	* ```
 	*/
 	rangeGt(column, range) {
 		this.url.searchParams.append(column, `sr.${range}`);
@@ -30840,6 +30916,54 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The range column to filter on
 	* @param range - The range to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription With `select()`
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .rangeGte('during', '[2000-01-02 08:30, 2000-01-02 09:30)')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	*   {
+	*     "data": [
+	*       {
+	*         "id": 2,
+	*         "room_name": "Topaz",
+	*         "during": "[\"2000-01-02 09:00:00\",\"2000-01-02 10:00:00\")"
+	*       }
+	*     ],
+	*     "status": 200,
+	*     "statusText": "OK"
+	*   }
+	*
+	* ```
 	*/
 	rangeGte(column, range) {
 		this.url.searchParams.append(column, `nxl.${range}`);
@@ -30851,6 +30975,53 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The range column to filter on
 	* @param range - The range to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription With `select()`
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .rangeLt('during', '[2000-01-01 15:00, 2000-01-01 16:00)')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "room_name": "Emerald",
+	*       "during": "[\"2000-01-01 13:00:00\",\"2000-01-01 15:00:00\")"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	rangeLt(column, range) {
 		this.url.searchParams.append(column, `sl.${range}`);
@@ -30863,6 +31034,54 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The range column to filter on
 	* @param range - The range to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription With `select()`
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .rangeLte('during', '[2000-01-01 14:00, 2000-01-01 16:00)')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	*   {
+	*     "data": [
+	*       {
+	*         "id": 1,
+	*         "room_name": "Emerald",
+	*         "during": "[\"2000-01-01 13:00:00\",\"2000-01-01 15:00:00\")"
+	*       }
+	*     ],
+	*     "status": 200,
+	*     "statusText": "OK"
+	*   }
+	*
+	* ```
 	*/
 	rangeLte(column, range) {
 		this.url.searchParams.append(column, `nxr.${range}`);
@@ -30875,6 +31094,53 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The range column to filter on
 	* @param range - The range to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription With `select()`
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .rangeAdjacent('during', '[2000-01-01 12:00, 2000-01-01 13:00)')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "room_name": "Emerald",
+	*       "during": "[\"2000-01-01 13:00:00\",\"2000-01-01 15:00:00\")"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	rangeAdjacent(column, range) {
 		this.url.searchParams.append(column, `adj.${range}`);
@@ -30886,6 +31152,90 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The array or range column to filter on
 	* @param value - The array or range value to filter with
+	*
+	* @category Database
+	*
+	* @example On array columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('issues')
+	*   .select('title')
+	*   .overlaps('tags', ['is:closed', 'severity:high'])
+	* ```
+	*
+	* @exampleSql On array columns
+	* ```sql
+	* create table
+	*   issues (
+	*     id int8 primary key,
+	*     title text,
+	*     tags text[]
+	*   );
+	*
+	* insert into
+	*   issues (id, title, tags)
+	* values
+	*   (1, 'Cache invalidation is not working', array['is:open', 'severity:high', 'priority:low']),
+	*   (2, 'Use better names', array['is:open', 'severity:low', 'priority:medium']);
+	* ```
+	*
+	* @exampleResponse On array columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "title": "Cache invalidation is not working"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription On range columns
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example On range columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .overlaps('during', '[2000-01-01 12:45, 2000-01-01 13:15)')
+	* ```
+	*
+	* @exampleSql On range columns
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse On range columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "room_name": "Emerald",
+	*       "during": "[\"2000-01-01 13:00:00\",\"2000-01-01 15:00:00\")"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	overlaps(column, value) {
 		if (typeof value === "string") this.url.searchParams.append(column, `ov.${value}`);
@@ -30901,6 +31251,99 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	* @param options - Named parameters
 	* @param options.config - The text search configuration to use
 	* @param options.type - Change how the `query` text is interpreted
+	*
+	* @category Database
+	*
+	* @remarks
+	* - For more information, see [Postgres full text search](/docs/guides/database/full-text-search).
+	*
+	* @example Text search
+	* ```ts
+	* const result = await supabase
+	*   .from("texts")
+	*   .select("content")
+	*   .textSearch("content", `'eggs' & 'ham'`, {
+	*     config: "english",
+	*   });
+	* ```
+	*
+	* @exampleSql Text search
+	* ```sql
+	* create table texts (
+	*   id      bigint
+	*           primary key
+	*           generated always as identity,
+	*   content text
+	* );
+	*
+	* insert into texts (content) values
+	*     ('Four score and seven years ago'),
+	*     ('The road goes ever on and on'),
+	*     ('Green eggs and ham')
+	* ;
+	* ```
+	*
+	* @exampleResponse Text search
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "content": "Green eggs and ham"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription Basic normalization
+	* Uses PostgreSQL's `plainto_tsquery` function.
+	*
+	* @example Basic normalization
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('quotes')
+	*   .select('catchphrase')
+	*   .textSearch('catchphrase', `'fat' & 'cat'`, {
+	*     type: 'plain',
+	*     config: 'english'
+	*   })
+	* ```
+	*
+	* @exampleDescription Full normalization
+	* Uses PostgreSQL's `phraseto_tsquery` function.
+	*
+	* @example Full normalization
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('quotes')
+	*   .select('catchphrase')
+	*   .textSearch('catchphrase', `'fat' & 'cat'`, {
+	*     type: 'phrase',
+	*     config: 'english'
+	*   })
+	* ```
+	*
+	* @exampleDescription Websearch
+	* Uses PostgreSQL's `websearch_to_tsquery` function.
+	* This function will never raise syntax errors, which makes it possible to use raw user-supplied input for search, and can be used
+	* with advanced operators.
+	*
+	* - `unquoted text`: text not inside quote marks will be converted to terms separated by & operators, as if processed by plainto_tsquery.
+	* - `"quoted text"`: text inside quote marks will be converted to terms separated by `<->` operators, as if processed by phraseto_tsquery.
+	* - `OR`: the word “or” will be converted to the | operator.
+	* - `-`: a dash will be converted to the ! operator.
+	*
+	* @example Websearch
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('quotes')
+	*   .select('catchphrase')
+	*   .textSearch('catchphrase', `'fat or cat'`, {
+	*     type: 'websearch',
+	*     config: 'english'
+	*   })
+	* ```
 	*/
 	textSearch(column, query, { config, type } = {}) {
 		let typePart = "";
@@ -30917,9 +31360,45 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param query - The object to filter with, with column names as keys mapped
 	* to their filter values
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('name')
+	*   .match({ id: 2, name: 'Leia' })
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Leia"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	match(query) {
-		Object.entries(query).forEach(([column, value]) => {
+		Object.entries(query).filter(([_, value]) => value !== void 0).forEach(([column, value]) => {
 			this.url.searchParams.append(column, `eq.${value}`);
 		});
 		return this;
@@ -30936,6 +31415,51 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	* @param operator - The operator to be negated to filter with, following
 	* PostgREST syntax
 	* @param value - The value to filter with, following PostgREST syntax
+	*
+	* @category Database
+	*
+	* @remarks
+	* not() expects you to use the raw PostgREST syntax for the filter values.
+	*
+	* ```ts
+	* .not('id', 'in', '(5,6,7)')  // Use `()` for `in` filter
+	* .not('arraycol', 'cs', '{"a","b"}')  // Use `cs` for `contains()`, `{}` for array values
+	* ```
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .not('name', 'is', null)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   countries (id int8 primary key, name text);
+	*
+	* insert into
+	*   countries (id, name)
+	* values
+	*   (1, 'null'),
+	*   (2, null);
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	*   {
+	*     "data": [
+	*       {
+	*         "id": 1,
+	*         "name": "null"
+	*       }
+	*     ],
+	*     "status": 200,
+	*     "statusText": "OK"
+	*   }
+	*
+	* ```
 	*/
 	not(column, operator, value) {
 		this.url.searchParams.append(column, `not.${operator}.${value}`);
@@ -30955,6 +31479,141 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	* @param options.referencedTable - Set this to filter on referenced tables
 	* instead of the parent table
 	* @param options.foreignTable - Deprecated, use `referencedTable` instead
+	*
+	* @category Database
+	*
+	* @remarks
+	* or() expects you to use the raw PostgREST syntax for the filter names and values.
+	*
+	* ```ts
+	* .or('id.in.(5,6,7), arraycol.cs.{"a","b"}')  // Use `()` for `in` filter, `{}` for array values and `cs` for `contains()`.
+	* .or('id.in.(5,6,7), arraycol.cd.{"a","b"}')  // Use `cd` for `containedBy()`
+	* ```
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('name')
+	*   .or('id.eq.2,name.eq.Han')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Leia"
+	*     },
+	*     {
+	*       "name": "Han"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example Use `or` with `and`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('name')
+	*   .or('id.gt.3,and(id.eq.1,name.eq.Luke)')
+	* ```
+	*
+	* @exampleSql Use `or` with `and`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse Use `or` with `and`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Luke"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example Use `or` on referenced tables
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('orchestral_sections')
+	*   .select(`
+	*     name,
+	*     instruments!inner (
+	*       name
+	*     )
+	*   `)
+	*   .or('section_id.eq.1,name.eq.guzheng', { referencedTable: 'instruments' })
+	* ```
+	*
+	* @exampleSql Use `or` on referenced tables
+	* ```sql
+	* create table
+	*   orchestral_sections (id int8 primary key, name text);
+	* create table
+	*   instruments (
+	*     id int8 primary key,
+	*     section_id int8 not null references orchestral_sections,
+	*     name text
+	*   );
+	*
+	* insert into
+	*   orchestral_sections (id, name)
+	* values
+	*   (1, 'strings'),
+	*   (2, 'woodwinds');
+	* insert into
+	*   instruments (id, section_id, name)
+	* values
+	*   (1, 2, 'flute'),
+	*   (2, 1, 'violin');
+	* ```
+	*
+	* @exampleResponse Use `or` on referenced tables
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "strings",
+	*       "instruments": [
+	*         {
+	*           "name": "violin"
+	*         }
+	*       ]
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	or(filters, { foreignTable, referencedTable = foreignTable } = {}) {
 		const key = referencedTable ? `${referencedTable}.or` : "or";
@@ -30973,6 +31632,105 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	* @param column - The column to filter on
 	* @param operator - The operator to filter with, following PostgREST syntax
 	* @param value - The value to filter with, following PostgREST syntax
+	*
+	* @category Database
+	*
+	* @remarks
+	* filter() expects you to use the raw PostgREST syntax for the filter values.
+	*
+	* ```ts
+	* .filter('id', 'in', '(5,6,7)')  // Use `()` for `in` filter
+	* .filter('arraycol', 'cs', '{"a","b"}')  // Use `cs` for `contains()`, `{}` for array values
+	* ```
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .filter('name', 'in', '("Han","Yoda")')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 3,
+	*       "name": "Han"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example On a referenced table
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('orchestral_sections')
+	*   .select(`
+	*     name,
+	*     instruments!inner (
+	*       name
+	*     )
+	*   `)
+	*   .filter('instruments.name', 'eq', 'flute')
+	* ```
+	*
+	* @exampleSql On a referenced table
+	* ```sql
+	* create table
+	*   orchestral_sections (id int8 primary key, name text);
+	* create table
+	*    instruments (
+	*     id int8 primary key,
+	*     section_id int8 not null references orchestral_sections,
+	*     name text
+	*   );
+	*
+	* insert into
+	*   orchestral_sections (id, name)
+	* values
+	*   (1, 'strings'),
+	*   (2, 'woodwinds');
+	* insert into
+	*   instruments (id, section_id, name)
+	* values
+	*   (1, 2, 'flute'),
+	*   (2, 1, 'violin');
+	* ```
+	*
+	* @exampleResponse On a referenced table
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "woodwinds",
+	*       "instruments": [
+	*         {
+	*           "name": "flute"
+	*         }
+	*       ]
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	filter(column, operator, value) {
 		this.url.searchParams.append(column, `${operator}.${value}`);
@@ -30988,7 +31746,19 @@ var PostgrestQueryBuilder = class {
 	*
 	* @example
 	* ```ts
-	* import PostgrestQueryBuilder from '@supabase/postgrest-js'
+	* import { PostgrestQueryBuilder } from '@supabase/postgrest-js'
+	*
+	* const query = new PostgrestQueryBuilder(
+	*   new URL('https://xyzcompany.supabase.co/rest/v1/users'),
+	*   { headers: { apikey: 'public-anon-key' } }
+	* )
+	* ```
+	*
+	* @category Database
+	*
+	* @example Example 1
+	* ```ts
+	* import { PostgrestQueryBuilder } from '@supabase/postgrest-js'
 	*
 	* const query = new PostgrestQueryBuilder(
 	*   new URL('https://xyzcompany.supabase.co/rest/v1/users'),
@@ -32351,6 +33121,105 @@ var PostgrestQueryBuilder = class {
 	*
 	* `"estimated"`: Uses exact count for low numbers and planned count for high
 	* numbers.
+	*
+	* @category Database
+	*
+	* @remarks
+	* - `delete()` should always be combined with [filters](/docs/reference/javascript/using-filters) to target the item(s) you wish to delete.
+	* - If you use `delete()` with filters and you have
+	*   [RLS](/docs/learn/auth-deep-dive/auth-row-level-security) enabled, only
+	*   rows visible through `SELECT` policies are deleted. Note that by default
+	*   no rows are visible, so you need at least one `SELECT`/`ALL` policy that
+	*   makes the rows visible.
+	* - When using `delete().in()`, specify an array of values to target multiple rows with a single query. This is particularly useful for batch deleting entries that share common criteria, such as deleting users by their IDs. Ensure that the array you provide accurately represents all records you intend to delete to avoid unintended data removal.
+	*
+	* @example Delete a single record
+	* ```ts
+	* const response = await supabase
+	*   .from('countries')
+	*   .delete()
+	*   .eq('id', 1)
+	* ```
+	*
+	* @exampleSql Delete a single record
+	* ```sql
+	* create table
+	*   countries (id int8 primary key, name text);
+	*
+	* insert into
+	*   countries (id, name)
+	* values
+	*   (1, 'Mordor');
+	* ```
+	*
+	* @exampleResponse Delete a single record
+	* ```json
+	* {
+	*   "status": 204,
+	*   "statusText": "No Content"
+	* }
+	* ```
+	*
+	* @example Delete a record and return it
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('countries')
+	*   .delete()
+	*   .eq('id', 1)
+	*   .select()
+	* ```
+	*
+	* @exampleSql Delete a record and return it
+	* ```sql
+	* create table
+	*   countries (id int8 primary key, name text);
+	*
+	* insert into
+	*   countries (id, name)
+	* values
+	*   (1, 'Mordor');
+	* ```
+	*
+	* @exampleResponse Delete a record and return it
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Mordor"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example Delete multiple records
+	* ```ts
+	* const response = await supabase
+	*   .from('countries')
+	*   .delete()
+	*   .in('id', [1, 2, 3])
+	* ```
+	*
+	* @exampleSql Delete multiple records
+	* ```sql
+	* create table
+	*   countries (id int8 primary key, name text);
+	*
+	* insert into
+	*   countries (id, name)
+	* values
+	*   (1, 'Rohan'), (2, 'The Shire'), (3, 'Mordor');
+	* ```
+	*
+	* @exampleResponse Delete multiple records
+	* ```json
+	* {
+	*   "status": 204,
+	*   "statusText": "No Content"
+	* }
+	* ```
 	*/
 	delete({ count } = {}) {
 		var _this$fetch4;
@@ -32459,7 +33328,34 @@ var PostgrestClient = class PostgrestClient {
 	* @param options.urlLengthLimit - Maximum URL length in characters before warnings/errors are triggered. Defaults to 8000.
 	* @example
 	* ```ts
-	* import PostgrestClient from '@supabase/postgrest-js'
+	* import { PostgrestClient } from '@supabase/postgrest-js'
+	*
+	* const postgrest = new PostgrestClient('https://xyzcompany.supabase.co/rest/v1', {
+	*   headers: { apikey: 'public-anon-key' },
+	*   schema: 'public',
+	*   timeout: 30000, // 30 second timeout
+	* })
+	* ```
+	*
+	* @category Database
+	*
+	* @remarks
+	* - A `timeout` option (in milliseconds) can be set to automatically abort requests that take too long.
+	* - A `urlLengthLimit` option (default: 8000) can be set to control when URL length warnings are included in error messages for aborted requests.
+	*
+	* @example Example 1
+	* ```ts
+	* import { PostgrestClient } from '@supabase/postgrest-js'
+	*
+	* const postgrest = new PostgrestClient('https://xyzcompany.supabase.co/rest/v1', {
+	*   headers: { apikey: 'public-anon-key' },
+	*   schema: 'public',
+	* })
+	* ```
+	*
+	* @example With timeout
+	* ```ts
+	* import { PostgrestClient } from '@supabase/postgrest-js'
 	*
 	* const postgrest = new PostgrestClient('https://xyzcompany.supabase.co/rest/v1', {
 	*   headers: { apikey: 'public-anon-key' },
@@ -32501,6 +33397,8 @@ var PostgrestClient = class PostgrestClient {
 	* Perform a query on a table or a view.
 	*
 	* @param relation - The table or view name to query
+	*
+	* @category Database
 	*/
 	from(relation) {
 		if (!relation || typeof relation !== "string" || relation.trim() === "") throw new Error("Invalid relation name: relation must be a non-empty string.");
@@ -32517,6 +33415,8 @@ var PostgrestClient = class PostgrestClient {
 	* The schema needs to be on the list of exposed schemas inside Supabase.
 	*
 	* @param schema - The schema to query
+	*
+	* @category Database
 	*/
 	schema(schema) {
 		return new PostgrestClient(this.url, {
@@ -32556,6 +33456,139 @@ var PostgrestClient = class PostgrestClient {
 	*   .schema('schema_b')
 	*   .rpc('function_a', {})
 	*   .overrideTypes<{ id: string; user_id: string }[]>()
+	* ```
+	*
+	* @category Database
+	*
+	* @example Call a Postgres function without arguments
+	* ```ts
+	* const { data, error } = await supabase.rpc('hello_world')
+	* ```
+	*
+	* @exampleSql Call a Postgres function without arguments
+	* ```sql
+	* create function hello_world() returns text as $$
+	*   select 'Hello world';
+	* $$ language sql;
+	* ```
+	*
+	* @exampleResponse Call a Postgres function without arguments
+	* ```json
+	* {
+	*   "data": "Hello world",
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example Call a Postgres function with arguments
+	* ```ts
+	* const { data, error } = await supabase.rpc('echo', { say: '👋' })
+	* ```
+	*
+	* @exampleSql Call a Postgres function with arguments
+	* ```sql
+	* create function echo(say text) returns text as $$
+	*   select say;
+	* $$ language sql;
+	* ```
+	*
+	* @exampleResponse Call a Postgres function with arguments
+	* ```json
+	*   {
+	*     "data": "👋",
+	*     "status": 200,
+	*     "statusText": "OK"
+	*   }
+	*
+	* ```
+	*
+	* @exampleDescription Bulk processing
+	* You can process large payloads by passing in an array as an argument.
+	*
+	* @example Bulk processing
+	* ```ts
+	* const { data, error } = await supabase.rpc('add_one_each', { arr: [1, 2, 3] })
+	* ```
+	*
+	* @exampleSql Bulk processing
+	* ```sql
+	* create function add_one_each(arr int[]) returns int[] as $$
+	*   select array_agg(n + 1) from unnest(arr) as n;
+	* $$ language sql;
+	* ```
+	*
+	* @exampleResponse Bulk processing
+	* ```json
+	* {
+	*   "data": [
+	*     2,
+	*     3,
+	*     4
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription Call a Postgres function with filters
+	* Postgres functions that return tables can also be combined with [Filters](/docs/reference/javascript/using-filters) and [Modifiers](/docs/reference/javascript/using-modifiers).
+	*
+	* @example Call a Postgres function with filters
+	* ```ts
+	* const { data, error } = await supabase
+	*   .rpc('list_stored_countries')
+	*   .eq('id', 1)
+	*   .single()
+	* ```
+	*
+	* @exampleSql Call a Postgres function with filters
+	* ```sql
+	* create table
+	*   countries (id int8 primary key, name text);
+	*
+	* insert into
+	*   countries (id, name)
+	* values
+	*   (1, 'Rohan'),
+	*   (2, 'The Shire');
+	*
+	* create function list_stored_countries() returns setof countries as $$
+	*   select * from countries;
+	* $$ language sql;
+	* ```
+	*
+	* @exampleResponse Call a Postgres function with filters
+	* ```json
+	* {
+	*   "data": {
+	*     "id": 1,
+	*     "name": "Rohan"
+	*   },
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example Call a read-only Postgres function
+	* ```ts
+	* const { data, error } = await supabase.rpc('hello_world', undefined, { get: true })
+	* ```
+	*
+	* @exampleSql Call a read-only Postgres function
+	* ```sql
+	* create function hello_world() returns text as $$
+	*   select 'Hello world';
+	* $$ language sql;
+	* ```
+	*
+	* @exampleResponse Call a read-only Postgres function
+	* ```json
+	* {
+	*   "data": "Hello world",
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
 	* ```
 	*/
 	rpc(fn, args = {}, { head = false, get = false, count } = {}) {
@@ -33459,25 +34492,17 @@ const _getErrorMessage = (err) => {
 * @param namespace - Error namespace ('storage' or 'vectors')
 */
 const handleError = async (error, reject, options, namespace) => {
-	if (error && typeof error === "object" && "status" in error && "ok" in error && typeof error.status === "number") {
+	if (error !== null && typeof error === "object" && typeof error.json === "function") {
 		const responseError = error;
-		const status = responseError.status || 500;
-		if (typeof responseError.json === "function") responseError.json().then((err) => {
+		let status = parseInt(responseError.status, 10);
+		if (!Number.isFinite(status)) status = 500;
+		responseError.json().then((err) => {
 			const statusCode = (err === null || err === void 0 ? void 0 : err.statusCode) || (err === null || err === void 0 ? void 0 : err.code) || status + "";
 			reject(new StorageApiError(_getErrorMessage(err), status, statusCode, namespace));
 		}).catch(() => {
-			if (namespace === "vectors") {
-				const statusCode = status + "";
-				reject(new StorageApiError(responseError.statusText || `HTTP ${status} error`, status, statusCode, namespace));
-			} else {
-				const statusCode = status + "";
-				reject(new StorageApiError(responseError.statusText || `HTTP ${status} error`, status, statusCode, namespace));
-			}
-		});
-		else {
 			const statusCode = status + "";
 			reject(new StorageApiError(responseError.statusText || `HTTP ${status} error`, status, statusCode, namespace));
-		}
+		});
 	} else reject(new StorageUnknownError(_getErrorMessage(error), error, namespace));
 };
 /**
@@ -34564,7 +35589,7 @@ var StorageFileApi = class extends BaseApiClient {
 
 //#endregion
 //#region src/lib/version.ts
-const version = "2.100.0-canary.0";
+const version = "2.99.3";
 
 //#endregion
 //#region src/lib/constants.ts
@@ -35928,7 +36953,7 @@ var auth_js_dist_main = __nccwpck_require__(6748);
 
 
 //#region src/lib/version.ts
-const dist_version = "2.100.0-canary.0";
+const dist_version = "2.99.3";
 
 //#endregion
 //#region src/lib/constants.ts
