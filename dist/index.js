@@ -7440,8 +7440,9 @@ async function navigatorLock(name, acquireTimeout, fn) {
         console.log('@supabase/gotrue-js: navigatorLock: acquire lock', name, acquireTimeout);
     }
     const abortController = new globalThis.AbortController();
+    let acquireTimeoutTimer;
     if (acquireTimeout > 0) {
-        setTimeout(() => {
+        acquireTimeoutTimer = setTimeout(() => {
             abortController.abort();
             if (exports.internals.debug) {
                 console.log('@supabase/gotrue-js: navigatorLock acquire timed out', name);
@@ -7468,6 +7469,12 @@ async function navigatorLock(name, acquireTimeout, fn) {
                 signal: abortController.signal,
             }, async (lock) => {
             if (lock) {
+                // Lock acquired — cancel the acquire-timeout timer so it cannot fire
+                // while fn() is running. Without this, a delayed timeout abort would
+                // set signal.aborted = true even though we already hold the lock,
+                // causing a subsequent steal to be misclassified as "our timeout
+                // fired" and triggering a spurious steal-back cascade.
+                clearTimeout(acquireTimeoutTimer);
                 if (exports.internals.debug) {
                     console.log('@supabase/gotrue-js: navigatorLock: acquired', name, lock.name);
                 }
@@ -7502,55 +7509,78 @@ async function navigatorLock(name, acquireTimeout, fn) {
                     // pretend the lock is acquired in the name of backward compatibility
                     // and user experience and just run the function.
                     console.warn('@supabase/gotrue-js: Navigator LockManager returned a null lock when using #request without ifAvailable set to true, it appears this browser is not following the LockManager spec https://developer.mozilla.org/en-US/docs/Web/API/LockManager/request');
+                    clearTimeout(acquireTimeoutTimer);
                     return await fn();
                 }
             }
         });
     }
     catch (e) {
+        // Always clear the acquire timeout once the request settles, so it cannot
+        // fire later and incorrectly abort/log after a rejection.
+        if (acquireTimeout > 0) {
+            clearTimeout(acquireTimeoutTimer);
+        }
         if ((e === null || e === void 0 ? void 0 : e.name) === 'AbortError' && acquireTimeout > 0) {
-            // The lock acquisition was aborted because the timeout fired while the
-            // request was still pending. This typically means another lock holder is
-            // not releasing the lock, possibly due to React Strict Mode's
-            // double-mount/unmount behavior or a component unmounting mid-operation,
-            // leaving an orphaned lock.
-            //
-            // Recovery: use { steal: true } to forcefully acquire the lock. Per the
-            // Web Locks API spec, this releases any currently held lock with the same
-            // name and grants the request immediately, preempting any queued requests.
-            // The previous holder's callback continues running to completion but no
-            // longer holds the lock for exclusion purposes.
-            //
-            // See: https://github.com/supabase/supabase/issues/42505
-            if (exports.internals.debug) {
-                console.log('@supabase/gotrue-js: navigatorLock: acquire timeout, recovering by stealing lock', name);
-            }
-            console.warn(`@supabase/gotrue-js: Lock "${name}" was not released within ${acquireTimeout}ms. ` +
-                'This may indicate an orphaned lock from a component unmount (e.g., React Strict Mode). ' +
-                'Forcefully acquiring the lock to recover.');
-            return await Promise.resolve().then(() => globalThis.navigator.locks.request(name, {
-                mode: 'exclusive',
-                steal: true,
-            }, async (lock) => {
-                if (lock) {
-                    if (exports.internals.debug) {
-                        console.log('@supabase/gotrue-js: navigatorLock: recovered (stolen)', name, lock.name);
-                    }
-                    try {
-                        return await fn();
-                    }
-                    finally {
+            if (abortController.signal.aborted) {
+                // OUR timeout fired — the lock is genuinely orphaned. Steal it.
+                //
+                // The lock acquisition was aborted because the timeout fired while the
+                // request was still pending. This typically means another lock holder is
+                // not releasing the lock, possibly due to React Strict Mode's
+                // double-mount/unmount behavior or a component unmounting mid-operation,
+                // leaving an orphaned lock.
+                //
+                // Recovery: use { steal: true } to forcefully acquire the lock. Per the
+                // Web Locks API spec, this releases any currently held lock with the same
+                // name and grants the request immediately, preempting any queued requests.
+                // The previous holder's callback continues running to completion but no
+                // longer holds the lock for exclusion purposes.
+                //
+                // See: https://github.com/supabase/supabase/issues/42505
+                if (exports.internals.debug) {
+                    console.log('@supabase/gotrue-js: navigatorLock: acquire timeout, recovering by stealing lock', name);
+                }
+                console.warn(`@supabase/gotrue-js: Lock "${name}" was not released within ${acquireTimeout}ms. ` +
+                    'This may indicate an orphaned lock from a component unmount (e.g., React Strict Mode). ' +
+                    'Forcefully acquiring the lock to recover.');
+                return await Promise.resolve().then(() => globalThis.navigator.locks.request(name, {
+                    mode: 'exclusive',
+                    steal: true,
+                }, async (lock) => {
+                    if (lock) {
                         if (exports.internals.debug) {
-                            console.log('@supabase/gotrue-js: navigatorLock: released (stolen)', name, lock.name);
+                            console.log('@supabase/gotrue-js: navigatorLock: recovered (stolen)', name, lock.name);
+                        }
+                        try {
+                            return await fn();
+                        }
+                        finally {
+                            if (exports.internals.debug) {
+                                console.log('@supabase/gotrue-js: navigatorLock: released (stolen)', name, lock.name);
+                            }
                         }
                     }
+                    else {
+                        // This should not happen with steal: true, but handle gracefully.
+                        console.warn('@supabase/gotrue-js: Navigator LockManager returned null lock even with steal: true');
+                        return await fn();
+                    }
+                }));
+            }
+            else {
+                // We HELD the lock but another request stole it from us.
+                // Per the Web Locks spec, our fn() callback is still running as an
+                // orphaned background task — do NOT steal back. Stealing back would
+                // cause a cascade (A steals B, B steals A, ...) and run fn() a second
+                // time concurrently, corrupting auth state.
+                // Convert to a typed error so callers (e.g. _autoRefreshTokenTick)
+                // can handle/filter it without it leaking to Sentry as a raw AbortError.
+                if (exports.internals.debug) {
+                    console.log('@supabase/gotrue-js: navigatorLock: lock was stolen by another request', name);
                 }
-                else {
-                    // This should not happen with steal: true, but handle gracefully.
-                    console.warn('@supabase/gotrue-js: Navigator LockManager returned null lock even with steal: true');
-                    return await fn();
-                }
-            }));
+                throw new NavigatorLockAcquireTimeoutError(`Lock "${name}" was released because another request stole it`);
+            }
         }
         throw e;
     }
@@ -7733,7 +7763,7 @@ exports.version = void 0;
 // - Debugging and support (identifying which version is running)
 // - Telemetry and logging (version reporting in errors/analytics)
 // - Ensuring build artifacts match the published package version
-exports.version = '2.100.0-canary.0';
+exports.version = '2.100.0';
 //# sourceMappingURL=version.js.map
 
 /***/ }),
@@ -11929,7 +11959,9 @@ class RealtimeChannel {
      * The topic determines which realtime stream you are subscribing to. Config options let you
      * enable acknowledgement for broadcasts, presence tracking, or private channels.
      *
-     * @example
+     * @category Realtime
+     *
+     * @example Example for a public channel
      * ```ts
      * import RealtimeClient from '@supabase/realtime-js'
      *
@@ -11965,7 +11997,10 @@ class RealtimeChannel {
             throw `tried to use replay on public channel '${this.topic}'. It must be a private channel.`;
         }
     }
-    /** Subscribe registers your client with the server */
+    /**
+     * Subscribe registers your client with the server
+     * @category Realtime
+     */
     subscribe(callback, timeout = this.timeout) {
         var _a, _b, _c;
         if (!this.socket.isConnected()) {
@@ -12049,6 +12084,8 @@ class RealtimeChannel {
      *
      * The shape is a map keyed by presence key (for example a user id) where each entry contains the
      * tracked metadata for that user.
+     *
+     * @category Realtime
      */
     presenceState() {
         return this.presence.state;
@@ -12056,6 +12093,8 @@ class RealtimeChannel {
     /**
      * Sends the supplied payload to the presence tracker so other subscribers can see that this
      * client is online. Use `untrack` to stop broadcasting presence for the same key.
+     *
+     * @category Realtime
      */
     async track(payload, opts = {}) {
         return await this.send({
@@ -12066,6 +12105,8 @@ class RealtimeChannel {
     }
     /**
      * Removes the current presence state for this client.
+     *
+     * @category Realtime
      */
     async untrack(opts = {}) {
         return await this.send({
@@ -12073,6 +12114,165 @@ class RealtimeChannel {
             event: 'untrack',
         }, opts);
     }
+    /**
+     * Listen to realtime events on this channel.
+     * @category Realtime
+     *
+     * @remarks
+     * - By default, Broadcast and Presence are enabled for all projects.
+     * - By default, listening to database changes is disabled for new projects due to database performance and security concerns. You can turn it on by managing Realtime's [replication](/docs/guides/api#realtime-api-overview).
+     * - You can receive the "previous" data for updates and deletes by setting the table's `REPLICA IDENTITY` to `FULL` (e.g., `ALTER TABLE your_table REPLICA IDENTITY FULL;`).
+     * - Row level security is not applied to delete statements. When RLS is enabled and replica identity is set to full, only the primary key is sent to clients.
+     *
+     * @example Listen to broadcast messages
+     * ```js
+     * const channel = supabase.channel("room1")
+     *
+     * channel.on("broadcast", { event: "cursor-pos" }, (payload) => {
+     *   console.log("Cursor position received!", payload);
+     * }).subscribe((status) => {
+     *   if (status === "SUBSCRIBED") {
+     *     channel.send({
+     *       type: "broadcast",
+     *       event: "cursor-pos",
+     *       payload: { x: Math.random(), y: Math.random() },
+     *     });
+     *   }
+     * });
+     * ```
+     *
+     * @example Listen to presence sync
+     * ```js
+     * const channel = supabase.channel('room1')
+     * channel
+     *   .on('presence', { event: 'sync' }, () => {
+     *     console.log('Synced presence state: ', channel.presenceState())
+     *   })
+     *   .subscribe(async (status) => {
+     *     if (status === 'SUBSCRIBED') {
+     *       await channel.track({ online_at: new Date().toISOString() })
+     *     }
+     *   })
+     * ```
+     *
+     * @example Listen to presence join
+     * ```js
+     * const channel = supabase.channel('room1')
+     * channel
+     *   .on('presence', { event: 'join' }, ({ newPresences }) => {
+     *     console.log('Newly joined presences: ', newPresences)
+     *   })
+     *   .subscribe(async (status) => {
+     *     if (status === 'SUBSCRIBED') {
+     *       await channel.track({ online_at: new Date().toISOString() })
+     *     }
+     *   })
+     * ```
+     *
+     * @example Listen to presence leave
+     * ```js
+     * const channel = supabase.channel('room1')
+     * channel
+     *   .on('presence', { event: 'leave' }, ({ leftPresences }) => {
+     *     console.log('Newly left presences: ', leftPresences)
+     *   })
+     *   .subscribe(async (status) => {
+     *     if (status === 'SUBSCRIBED') {
+     *       await channel.track({ online_at: new Date().toISOString() })
+     *       await channel.untrack()
+     *     }
+     *   })
+     * ```
+     *
+     * @example Listen to all database changes
+     * ```js
+     * supabase
+     *   .channel('room1')
+     *   .on('postgres_changes', { event: '*', schema: '*' }, payload => {
+     *     console.log('Change received!', payload)
+     *   })
+     *   .subscribe()
+     * ```
+     *
+     * @example Listen to a specific table
+     * ```js
+     * supabase
+     *   .channel('room1')
+     *   .on('postgres_changes', { event: '*', schema: 'public', table: 'countries' }, payload => {
+     *     console.log('Change received!', payload)
+     *   })
+     *   .subscribe()
+     * ```
+     *
+     * @example Listen to inserts
+     * ```js
+     * supabase
+     *   .channel('room1')
+     *   .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'countries' }, payload => {
+     *     console.log('Change received!', payload)
+     *   })
+     *   .subscribe()
+     * ```
+     *
+     * @exampleDescription Listen to updates
+     * By default, Supabase will send only the updated record. If you want to receive the previous values as well you can
+     * enable full replication for the table you are listening to:
+     *
+     * ```sql
+     * alter table "your_table" replica identity full;
+     * ```
+     *
+     * @example Listen to updates
+     * ```js
+     * supabase
+     *   .channel('room1')
+     *   .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'countries' }, payload => {
+     *     console.log('Change received!', payload)
+     *   })
+     *   .subscribe()
+     * ```
+     *
+     * @exampleDescription Listen to deletes
+     * By default, Supabase does not send deleted records. If you want to receive the deleted record you can
+     * enable full replication for the table you are listening to:
+     *
+     * ```sql
+     * alter table "your_table" replica identity full;
+     * ```
+     *
+     * @example Listen to deletes
+     * ```js
+     * supabase
+     *   .channel('room1')
+     *   .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'countries' }, payload => {
+     *     console.log('Change received!', payload)
+     *   })
+     *   .subscribe()
+     * ```
+     *
+     * @exampleDescription Listen to multiple events
+     * You can chain listeners if you want to listen to multiple events for each table.
+     *
+     * @example Listen to multiple events
+     * ```js
+     * supabase
+     *   .channel('room1')
+     *   .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'countries' }, handleRecordInserted)
+     *   .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'countries' }, handleRecordDeleted)
+     *   .subscribe()
+     * ```
+     *
+     * @exampleDescription Listen to row level changes
+     * You can listen to individual rows using the format `{table}:{col}=eq.{val}` - where `{col}` is the column name, and `{val}` is the value which you want to match.
+     *
+     * @example Listen to row level changes
+     * ```js
+     * supabase
+     *   .channel('room1')
+     *   .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'countries', filter: 'id=eq.200' }, handleRecordUpdated)
+     *   .subscribe()
+     * ```
+     */
     on(type, filter, callback) {
         if (this.channelAdapter.isJoined() && type === REALTIME_LISTEN_TYPES.PRESENCE) {
             this.socket.log('channel', `cannot add presence callbacks for ${this.topic} after joining.`);
@@ -12090,6 +12290,8 @@ class RealtimeChannel {
      * @param payload Payload to be sent (required)
      * @param opts Options including timeout
      * @returns Promise resolving to object with success status, and error details if failed
+     *
+     * @category Realtime
      */
     async httpSend(event, payload, opts = {}) {
         var _a;
@@ -12137,6 +12339,39 @@ class RealtimeChannel {
      * @param args.event The name of the event being sent
      * @param args.payload Payload to be sent
      * @param opts Options to be used during the send process
+     *
+     * @category Realtime
+     *
+     * @remarks
+     * - When using REST you don't need to subscribe to the channel
+     * - REST calls are only available from 2.37.0 onwards
+     *
+     * @example Send a message via websocket
+     * ```js
+     * const channel = supabase.channel('room1')
+     *
+     * channel.subscribe((status) => {
+     *   if (status === 'SUBSCRIBED') {
+     *     channel.send({
+     *       type: 'broadcast',
+     *       event: 'cursor-pos',
+     *       payload: { x: Math.random(), y: Math.random() },
+     *     })
+     *   }
+     * })
+     * ```
+     *
+     * @exampleResponse Send a message via websocket
+     * ```js
+     * ok | timed out | error
+     * ```
+     *
+     * @example Send a message via REST
+     * ```js
+     * supabase
+     *   .channel('room1')
+     *   .httpSend('cursor-pos', { x: Math.random(), y: Math.random() })
+     * ```
      */
     async send(args, opts = {}) {
         var _a, _b;
@@ -12196,6 +12431,8 @@ class RealtimeChannel {
     /**
      * Updates the payload that will be sent the next time the channel joins (reconnects).
      * Useful for rotating access tokens or updating config without re-creating the channel.
+     *
+     * @category Realtime
      */
     updateJoinPayload(payload) {
         this.channelAdapter.updateJoinPayload(payload);
@@ -12208,6 +12445,8 @@ class RealtimeChannel {
      *
      * To receive leave acknowledgements, use the a `receive` hook to bind to the server ack, ie:
      * channel.unsubscribe().receive("ok", () => alert("left!") )
+     *
+     * @category Realtime
      */
     async unsubscribe(timeout = this.timeout) {
         return new Promise((resolve) => {
@@ -12220,6 +12459,8 @@ class RealtimeChannel {
     }
     /**
      * Destroys and stops related timers.
+     *
+     * @category Realtime
      */
     teardown() {
         this.channelAdapter.teardown();
@@ -12449,7 +12690,10 @@ class RealtimeClient {
      * @param options.worker Use Web Worker to set a side flow. Defaults to false.
      * @param options.workerUrl The URL of the worker script. Defaults to https://realtime.supabase.com/worker.js that includes a heartbeat event call to keep the connection alive.
      * @param options.vsn The protocol version to use when connecting. Supported versions are "1.0.0" and "2.0.0". Defaults to "2.0.0".
-     * @example
+     *
+     * @category Realtime
+     *
+     * @example Example for a public channel
      * ```ts
      * import RealtimeClient from '@supabase/realtime-js'
      *
@@ -12498,6 +12742,8 @@ class RealtimeClient {
     }
     /**
      * Connects the socket, unless already connected.
+     *
+     * @category Realtime
      */
     connect() {
         // Skip if already connecting, disconnecting, or connected
@@ -12536,6 +12782,8 @@ class RealtimeClient {
     /**
      * Returns the URL of the websocket.
      * @returns string The URL of the websocket.
+     *
+     * @category Realtime
      */
     endpointURL() {
         return this.socketAdapter.endPointURL();
@@ -12545,6 +12793,8 @@ class RealtimeClient {
      *
      * @param code A numeric status code to send on disconnect.
      * @param reason A custom reason for the disconnect.
+     *
+     * @category Realtime
      */
     async disconnect(code, reason) {
         if (this.isDisconnecting()) {
@@ -12557,6 +12807,8 @@ class RealtimeClient {
     }
     /**
      * Returns all created channels
+     *
+     * @category Realtime
      */
     getChannels() {
         return this.channels;
@@ -12564,6 +12816,8 @@ class RealtimeClient {
     /**
      * Unsubscribes, removes and tears down a single channel
      * @param channel A RealtimeChannel instance
+     *
+     * @category Realtime
      */
     async removeChannel(channel) {
         const status = await channel.unsubscribe();
@@ -12577,6 +12831,8 @@ class RealtimeClient {
     }
     /**
      * Unsubscribes, removes and tears down all channels
+     *
+     * @category Realtime
      */
     async removeAllChannels() {
         const promises = this.channels.map(async (channel) => {
@@ -12592,30 +12848,40 @@ class RealtimeClient {
      * Logs the message.
      *
      * For customized logging, `this.logger` can be overridden in Client constructor.
+     *
+     * @category Realtime
      */
     log(kind, msg, data) {
         this.socketAdapter.log(kind, msg, data);
     }
     /**
      * Returns the current state of the socket.
+     *
+     * @category Realtime
      */
     connectionState() {
         return this.socketAdapter.connectionState() || constants_1.CONNECTION_STATE.closed;
     }
     /**
      * Returns `true` is the connection is open.
+     *
+     * @category Realtime
      */
     isConnected() {
         return this.socketAdapter.isConnected();
     }
     /**
      * Returns `true` if the connection is currently connecting.
+     *
+     * @category Realtime
      */
     isConnecting() {
         return this.socketAdapter.isConnecting();
     }
     /**
      * Returns `true` if the connection is currently disconnecting.
+     *
+     * @category Realtime
      */
     isDisconnecting() {
         return this.socketAdapter.isDisconnecting();
@@ -12626,6 +12892,8 @@ class RealtimeClient {
      * Topics are automatically prefixed with `realtime:` to match the Realtime service.
      * If a channel with the same topic already exists it will be returned instead of creating
      * a duplicate connection.
+     *
+     * @category Realtime
      */
     channel(topic, params = { config: {} }) {
         const realtimeTopic = `realtime:${topic}`;
@@ -12643,6 +12911,8 @@ class RealtimeClient {
      * Push out a message if the socket is connected.
      *
      * If the socket is not connected, the message gets enqueued within a local buffer, and sent out when a connection is next established.
+     *
+     * @category Realtime
      */
     push(data) {
         this.socketAdapter.push(data);
@@ -12666,6 +12936,8 @@ class RealtimeClient {
      *
      * // Switch back to using the accessToken callback
      * client.realtime.setAuth()
+     *
+     * @category Realtime
      */
     async setAuth(token = null) {
         this._authPromise = this._performAuth(token);
@@ -12686,6 +12958,8 @@ class RealtimeClient {
     }
     /**
      * Sends a heartbeat message if the socket is connected.
+     *
+     * @category Realtime
      */
     async sendHeartbeat() {
         this.socketAdapter.sendHeartbeat();
@@ -12693,6 +12967,8 @@ class RealtimeClient {
     /**
      * Sets a callback that receives lifecycle events for internal heartbeat messages.
      * Useful for instrumenting connection health (e.g. sent/ok/timeout/disconnected).
+     *
+     * @category Realtime
      */
     onHeartbeat(callback) {
         this.socketAdapter.heartbeatCallback = this._wrapHeartbeatCallback(callback);
@@ -12973,7 +13249,9 @@ class RealtimePresence {
      * @param channel - The realtime channel to bind to.
      * @param opts - Optional custom event names, e.g. `{ events: { state: 'state', diff: 'diff' } }`.
      *
-     * @example
+     * @category Realtime
+     *
+     * @example Example for a presence channel
      * ```ts
      * const presence = new RealtimePresence(channel)
      *
@@ -13491,7 +13769,7 @@ exports.version = void 0;
 // - Debugging and support (identifying which version is running)
 // - Telemetry and logging (version reporting in errors/analytics)
 // - Ensuring build artifacts match the published package version
-exports.version = '2.100.0-canary.0';
+exports.version = '2.100.0';
 //# sourceMappingURL=version.js.map
 
 /***/ }),
@@ -13579,10 +13857,16 @@ class WebSocketFactory {
     /**
      * Returns the best available WebSocket constructor for the current runtime.
      *
-     * @example
+     * @category Realtime
+     *
+     * @example Example with error handling
      * ```ts
-     * const WS = WebSocketFactory.getWebSocketConstructor()
-     * const socket = new WS('wss://realtime.supabase.co/socket')
+     * try {
+     *   const WS = WebSocketFactory.getWebSocketConstructor()
+     *   const socket = new WS('wss://example.com/socket')
+     * } catch (error) {
+     *   console.error('WebSocket not available in this environment.', error)
+     * }
      * ```
      */
     static getWebSocketConstructor() {
@@ -13599,10 +13883,13 @@ class WebSocketFactory {
     /**
      * Detects whether the runtime can establish WebSocket connections.
      *
-     * @example
+     * @category Realtime
+     *
+     * @example Example in a Node.js script
      * ```ts
      * if (!WebSocketFactory.isWebSocketSupported()) {
-     *   console.warn('Falling back to long polling')
+     *   console.error('WebSockets are required for this script.')
+     *   process.exitCode = 1
      * }
      * ```
      */
@@ -30196,7 +30483,19 @@ var PostgrestBuilder = class {
 	*
 	* @example
 	* ```ts
-	* import PostgrestQueryBuilder from '@supabase/postgrest-js'
+	* import { PostgrestQueryBuilder } from '@supabase/postgrest-js'
+	*
+	* const builder = new PostgrestQueryBuilder(
+	*   new URL('https://xyzcompany.supabase.co/rest/v1/users'),
+	*   { headers: new Headers({ apikey: 'public-anon-key' }) }
+	* )
+	* ```
+	*
+	* @category Database
+	*
+	* @example Example 1
+	* ```ts
+	* import { PostgrestQueryBuilder } from '@supabase/postgrest-js'
 	*
 	* const builder = new PostgrestQueryBuilder(
 	*   new URL('https://xyzcompany.supabase.co/rest/v1/users'),
@@ -30224,6 +30523,8 @@ var PostgrestBuilder = class {
 	* throwing the error instead of returning it as part of a successful response.
 	*
 	* {@link https://github.com/supabase/supabase-js/issues/92}
+	*
+	* @category Database
 	*/
 	throwOnError() {
 		this.shouldThrowOnError = true;
@@ -30231,12 +30532,17 @@ var PostgrestBuilder = class {
 	}
 	/**
 	* Set an HTTP header for the request.
+	*
+	* @category Database
 	*/
 	setHeader(name, value) {
 		this.headers = new Headers(this.headers);
 		this.headers.set(name, value);
 		return this;
 	}
+	/**  *
+	* @category Database
+	*/
 	then(onfulfilled, onrejected) {
 		var _this = this;
 		if (this.schema === void 0) {} else if (["GET", "HEAD"].includes(this.method)) this.headers.set("Accept-Profile", this.schema);
@@ -30359,6 +30665,8 @@ var PostgrestBuilder = class {
 	*
 	* @typeParam NewResult - The new result type to override with
 	* @deprecated Use overrideTypes<yourType, { merge: false }>() method at the end of your call chain instead
+	*
+	* @category Database
 	*/
 	returns() {
 		/* istanbul ignore next */
@@ -30385,6 +30693,77 @@ var PostgrestBuilder = class {
 	*   .overrideTypes<{ id: number; name: string }, { merge: false }>()
 	* ```
 	* @returns A PostgrestBuilder instance with the new type
+	*
+	* @category Database
+	*
+	* @example Complete Override type of successful response
+	* ```ts
+	* const { data } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .overrideTypes<Array<MyType>, { merge: false }>()
+	* ```
+	*
+	* @exampleResponse Complete Override type of successful response
+	* ```ts
+	* let x: typeof data // MyType[]
+	* ```
+	*
+	* @example Complete Override type of object response
+	* ```ts
+	* const { data } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .maybeSingle()
+	*   .overrideTypes<MyType, { merge: false }>()
+	* ```
+	*
+	* @exampleResponse Complete Override type of object response
+	* ```ts
+	* let x: typeof data // MyType | null
+	* ```
+	*
+	* @example Partial Override type of successful response
+	* ```ts
+	* const { data } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .overrideTypes<Array<{ status: "A" | "B" }>>()
+	* ```
+	*
+	* @exampleResponse Partial Override type of successful response
+	* ```ts
+	* let x: typeof data // Array<CountryRowProperties & { status: "A" | "B" }>
+	* ```
+	*
+	* @example Partial Override type of object response
+	* ```ts
+	* const { data } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .maybeSingle()
+	*   .overrideTypes<{ status: "A" | "B" }>()
+	* ```
+	*
+	* @exampleResponse Partial Override type of object response
+	* ```ts
+	* let x: typeof data // CountryRowProperties & { status: "A" | "B" } | null
+	* ```
+	*
+	* @example Example 5
+	* ```typescript
+	* // Merge with existing types (default behavior)
+	* const query = supabase
+	*   .from('users')
+	*   .select()
+	*   .overrideTypes<{ custom_field: string }>()
+	*
+	* // Replace existing types completely
+	* const replaceQuery = supabase
+	*   .from('users')
+	*   .select()
+	*   .overrideTypes<{ id: number; name: string }, { merge: false }>()
+	* ```
 	*/
 	overrideTypes() {
 		return this;
@@ -30402,6 +30781,41 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* `data`.
 	*
 	* @param columns - The columns to retrieve, separated by commas
+	*
+	* @category Database
+	*
+	* @example With `upsert()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .upsert({ id: 1, name: 'Han Solo' })
+	*   .select()
+	* ```
+	*
+	* @exampleSql With `upsert()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Han');
+	* ```
+	*
+	* @exampleResponse With `upsert()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Han Solo"
+	*     }
+	*   ],
+	*   "status": 201,
+	*   "statusText": "Created"
+	* }
+	* ```
 	*/
 	select(columns) {
 		let quoted = false;
@@ -30431,6 +30845,176 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* its columns
 	* @param options.foreignTable - Deprecated, use `options.referencedTable`
 	* instead
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('id, name')
+	*   .order('id', { ascending: false })
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 3,
+	*       "name": "Han"
+	*     },
+	*     {
+	*       "id": 2,
+	*       "name": "Leia"
+	*     },
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription On a referenced table
+	* Ordering with `referencedTable` doesn't affect the ordering of the
+	* parent table.
+	*
+	* @example On a referenced table
+	* ```ts
+	*   const { data, error } = await supabase
+	*     .from('orchestral_sections')
+	*     .select(`
+	*       name,
+	*       instruments (
+	*         name
+	*       )
+	*     `)
+	*     .order('name', { referencedTable: 'instruments', ascending: false })
+	*
+	* ```
+	*
+	* @exampleSql On a referenced table
+	* ```sql
+	* create table
+	*   orchestral_sections (id int8 primary key, name text);
+	* create table
+	*   instruments (
+	*     id int8 primary key,
+	*     section_id int8 not null references orchestral_sections,
+	*     name text
+	*   );
+	*
+	* insert into
+	*   orchestral_sections (id, name)
+	* values
+	*   (1, 'strings'),
+	*   (2, 'woodwinds');
+	* insert into
+	*   instruments (id, section_id, name)
+	* values
+	*   (1, 1, 'harp'),
+	*   (2, 1, 'violin');
+	* ```
+	*
+	* @exampleResponse On a referenced table
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "strings",
+	*       "instruments": [
+	*         {
+	*           "name": "violin"
+	*         },
+	*         {
+	*           "name": "harp"
+	*         }
+	*       ]
+	*     },
+	*     {
+	*       "name": "woodwinds",
+	*       "instruments": []
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription Order parent table by a referenced table
+	* Ordering with `referenced_table(col)` affects the ordering of the
+	* parent table.
+	*
+	* @example Order parent table by a referenced table
+	* ```ts
+	*   const { data, error } = await supabase
+	*     .from('instruments')
+	*     .select(`
+	*       name,
+	*       section:orchestral_sections (
+	*         name
+	*       )
+	*     `)
+	*     .order('section(name)', { ascending: true })
+	*
+	* ```
+	*
+	* @exampleSql Order parent table by a referenced table
+	* ```sql
+	* create table
+	*   orchestral_sections (id int8 primary key, name text);
+	* create table
+	*   instruments (
+	*     id int8 primary key,
+	*     section_id int8 not null references orchestral_sections,
+	*     name text
+	*   );
+	*
+	* insert into
+	*   orchestral_sections (id, name)
+	* values
+	*   (1, 'strings'),
+	*   (2, 'woodwinds');
+	* insert into
+	*   instruments (id, section_id, name)
+	* values
+	*   (1, 2, 'flute'),
+	*   (2, 1, 'violin');
+	* ```
+	*
+	* @exampleResponse Order parent table by a referenced table
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "violin",
+	*       "orchestral_sections": {"name": "strings"}
+	*     },
+	*     {
+	*       "name": "flute",
+	*       "orchestral_sections": {"name": "woodwinds"}
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	order(column, { ascending = true, nullsFirst, foreignTable, referencedTable = foreignTable } = {}) {
 		const key = referencedTable ? `${referencedTable}.order` : "order";
@@ -30447,6 +31031,95 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* tables instead of the parent table
 	* @param options.foreignTable - Deprecated, use `options.referencedTable`
 	* instead
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('name')
+	*   .limit(1)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Luke"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example On a referenced table
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('orchestral_sections')
+	*   .select(`
+	*     name,
+	*     instruments (
+	*       name
+	*     )
+	*   `)
+	*   .limit(1, { referencedTable: 'instruments' })
+	* ```
+	*
+	* @exampleSql On a referenced table
+	* ```sql
+	* create table
+	*   orchestral_sections (id int8 primary key, name text);
+	* create table
+	*   instruments (
+	*     id int8 primary key,
+	*     section_id int8 not null references orchestral_sections,
+	*     name text
+	*   );
+	*
+	* insert into
+	*   orchestral_sections (id, name)
+	* values
+	*   (1, 'strings');
+	* insert into
+	*   instruments (id, section_id, name)
+	* values
+	*   (1, 1, 'harp'),
+	*   (2, 1, 'violin');
+	* ```
+	*
+	* @exampleResponse On a referenced table
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "strings",
+	*       "instruments": [
+	*         {
+	*           "name": "violin"
+	*         }
+	*       ]
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	limit(count, { foreignTable, referencedTable = foreignTable } = {}) {
 		const key = typeof referencedTable === "undefined" ? "limit" : `${referencedTable}.limit`;
@@ -30467,6 +31140,45 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* tables instead of the parent table
 	* @param options.foreignTable - Deprecated, use `options.referencedTable`
 	* instead
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('name')
+	*   .range(0, 1)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Luke"
+	*     },
+	*     {
+	*       "name": "Leia"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	range(from, to, { foreignTable, referencedTable = foreignTable } = {}) {
 		const keyOffset = typeof referencedTable === "undefined" ? "offset" : `${referencedTable}.offset`;
@@ -30479,6 +31191,66 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* Set the AbortSignal for the fetch request.
 	*
 	* @param signal - The AbortSignal to use for the fetch request
+	*
+	* @category Database
+	*
+	* @remarks
+	* You can use this to set a timeout for the request.
+	*
+	* @exampleDescription Aborting requests in-flight
+	* You can use an [`AbortController`](https://developer.mozilla.org/en-US/docs/Web/API/AbortController) to abort requests.
+	* Note that `status` and `statusText` don't mean anything for aborted requests as the request wasn't fulfilled.
+	*
+	* @example Aborting requests in-flight
+	* ```ts
+	* const ac = new AbortController()
+	*
+	* const { data, error } = await supabase
+	*   .from('very_big_table')
+	*   .select()
+	*   .abortSignal(ac.signal)
+	*
+	* // Abort the request after 100 ms
+	* setTimeout(() => ac.abort(), 100)
+	* ```
+	*
+	* @exampleResponse Aborting requests in-flight
+	* ```json
+	*   {
+	*     "error": {
+	*       "message": "AbortError: The user aborted a request.",
+	*       "details": "",
+	*       "hint": "The request was aborted locally via the provided AbortSignal.",
+	*       "code": ""
+	*     },
+	*     "status": 0,
+	*     "statusText": ""
+	*   }
+	*
+	* ```
+	*
+	* @example Set a timeout
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('very_big_table')
+	*   .select()
+	*   .abortSignal(AbortSignal.timeout(1000 /* ms *\/))
+	* ```
+	*
+	* @exampleResponse Set a timeout
+	* ```json
+	*   {
+	*     "error": {
+	*       "message": "FetchError: The user aborted a request.",
+	*       "details": "",
+	*       "hint": "",
+	*       "code": ""
+	*     },
+	*     "status": 400,
+	*     "statusText": "Bad Request"
+	*   }
+	*
+	* ```
 	*/
 	abortSignal(signal) {
 		this.signal = signal;
@@ -30489,6 +31261,41 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	*
 	* Query result must be one row (e.g. using `.limit(1)`), otherwise this
 	* returns an error.
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('name')
+	*   .limit(1)
+	*   .single()
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": {
+	*     "name": "Luke"
+	*   },
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	single() {
 		this.headers.set("Accept", "application/vnd.pgrst.object+json");
@@ -30499,6 +31306,38 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	*
 	* Query result must be zero or one row (e.g. using `.limit(1)`), otherwise
 	* this returns an error.
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .eq('name', 'Katniss')
+	*   .maybeSingle()
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	maybeSingle() {
 		if (this.method === "GET") this.headers.set("Accept", "application/json");
@@ -30508,6 +31347,41 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	}
 	/**
 	* Return `data` as a string in CSV format.
+	*
+	* @category Database
+	*
+	* @exampleDescription Return data as CSV
+	* By default, the data is returned in JSON format, but can also be returned as Comma Separated Values.
+	*
+	* @example Return data as CSV
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .csv()
+	* ```
+	*
+	* @exampleSql Return data as CSV
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse Return data as CSV
+	* ```json
+	* {
+	*   "data": "id,name\n1,Luke\n2,Leia\n3,Han",
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	csv() {
 		this.headers.set("Accept", "text/csv");
@@ -30515,6 +31389,8 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	}
 	/**
 	* Return `data` as an object in [GeoJSON](https://geojson.org) format.
+	*
+	* @category Database
 	*/
 	geojson() {
 		this.headers.set("Accept", "application/geo+json");
@@ -30544,6 +31420,76 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	*
 	* @param options.format - The format of the output, can be `"text"` (default)
 	* or `"json"`
+	*
+	* @category Database
+	*
+	* @exampleDescription Get the execution plan
+	* By default, the data is returned in TEXT format, but can also be returned as JSON by using the `format` parameter.
+	*
+	* @example Get the execution plan
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .explain()
+	* ```
+	*
+	* @exampleSql Get the execution plan
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse Get the execution plan
+	* ```js
+	* Aggregate  (cost=33.34..33.36 rows=1 width=112)
+	*   ->  Limit  (cost=0.00..18.33 rows=1000 width=40)
+	*         ->  Seq Scan on characters  (cost=0.00..22.00 rows=1200 width=40)
+	* ```
+	*
+	* @exampleDescription Get the execution plan with analyze and verbose
+	* By default, the data is returned in TEXT format, but can also be returned as JSON by using the `format` parameter.
+	*
+	* @example Get the execution plan with analyze and verbose
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .explain({analyze:true,verbose:true})
+	* ```
+	*
+	* @exampleSql Get the execution plan with analyze and verbose
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse Get the execution plan with analyze and verbose
+	* ```js
+	* Aggregate  (cost=33.34..33.36 rows=1 width=112) (actual time=0.041..0.041 rows=1 loops=1)
+	*   Output: NULL::bigint, count(ROW(characters.id, characters.name)), COALESCE(json_agg(ROW(characters.id, characters.name)), '[]'::json), NULLIF(current_setting('response.headers'::text, true), ''::text), NULLIF(current_setting('response.status'::text, true), ''::text)
+	*   ->  Limit  (cost=0.00..18.33 rows=1000 width=40) (actual time=0.005..0.006 rows=3 loops=1)
+	*         Output: characters.id, characters.name
+	*         ->  Seq Scan on public.characters  (cost=0.00..22.00 rows=1200 width=40) (actual time=0.004..0.005 rows=3 loops=1)
+	*               Output: characters.id, characters.name
+	* Query Identifier: -4730654291623321173
+	* Planning Time: 0.407 ms
+	* Execution Time: 0.119 ms
+	* ```
 	*/
 	explain({ analyze = false, verbose = false, settings = false, buffers = false, wal = false, format = "text" } = {}) {
 		var _this$headers$get;
@@ -30563,6 +31509,8 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* Rollback the query.
 	*
 	* `data` will still be returned, but the query is not committed.
+	*
+	* @category Database
 	*/
 	rollback() {
 		this.headers.append("Prefer", "tx=rollback");
@@ -30573,6 +31521,38 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	*
 	* @typeParam NewResult - The new result type to override with
 	* @deprecated Use overrideTypes<yourType, { merge: false }>() method at the end of your call chain instead
+	*
+	* @category Database
+	*
+	* @remarks
+	* - Deprecated: use overrideTypes method instead
+	*
+	* @example Override type of successful response
+	* ```ts
+	* const { data } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .returns<Array<MyType>>()
+	* ```
+	*
+	* @exampleResponse Override type of successful response
+	* ```js
+	* let x: typeof data // MyType[]
+	* ```
+	*
+	* @example Override type of object response
+	* ```ts
+	* const { data } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .maybeSingle()
+	*   .returns<MyType>()
+	* ```
+	*
+	* @exampleResponse Override type of object response
+	* ```js
+	* let x: typeof data // MyType | null
+	* ```
 	*/
 	returns() {
 		return this;
@@ -30582,6 +31562,8 @@ var PostgrestTransformBuilder = class extends PostgrestBuilder {
 	* Only available in PostgREST v13+ and only works with PATCH and DELETE methods.
 	*
 	* @param value - The maximum number of rows that can be affected
+	*
+	* @category Database
 	*/
 	maxAffected(value) {
 		this.headers.append("Prefer", "handling=strict");
@@ -30601,6 +31583,43 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .eq('name', 'Leia')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 2,
+	*       "name": "Leia"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	eq(column, value) {
 		this.url.searchParams.append(column, `eq.${value}`);
@@ -30611,6 +31630,47 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .neq('name', 'Leia')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     },
+	*     {
+	*       "id": 3,
+	*       "name": "Han"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	neq(column, value) {
 		this.url.searchParams.append(column, `neq.${value}`);
@@ -30621,6 +31681,47 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription With `select()`
+	* When using [reserved words](https://www.postgresql.org/docs/current/sql-keywords-appendix.html) for column names you need
+	* to add double quotes e.g. `.gt('"order"', 2)`
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .gt('id', 2)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 3,
+	*       "name": "Han"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	gt(column, value) {
 		this.url.searchParams.append(column, `gt.${value}`);
@@ -30631,6 +31732,47 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .gte('id', 2)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 2,
+	*       "name": "Leia"
+	*     },
+	*     {
+	*       "id": 3,
+	*       "name": "Han"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	gte(column, value) {
 		this.url.searchParams.append(column, `gte.${value}`);
@@ -30641,6 +31783,43 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .lt('id', 2)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	lt(column, value) {
 		this.url.searchParams.append(column, `lt.${value}`);
@@ -30651,6 +31830,47 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .lte('id', 2)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     },
+	*     {
+	*       "id": 2,
+	*       "name": "Leia"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	lte(column, value) {
 		this.url.searchParams.append(column, `lte.${value}`);
@@ -30661,6 +31881,43 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param pattern - The pattern to match with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .like('name', '%Lu%')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	like(column, pattern) {
 		this.url.searchParams.append(column, `like.${pattern}`);
@@ -30671,6 +31928,8 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param patterns - The patterns to match with
+	*
+	* @category Database
 	*/
 	likeAllOf(column, patterns) {
 		this.url.searchParams.append(column, `like(all).{${patterns.join(",")}}`);
@@ -30681,6 +31940,8 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param patterns - The patterns to match with
+	*
+	* @category Database
 	*/
 	likeAnyOf(column, patterns) {
 		this.url.searchParams.append(column, `like(any).{${patterns.join(",")}}`);
@@ -30691,6 +31952,43 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param pattern - The pattern to match with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .ilike('name', '%lu%')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	ilike(column, pattern) {
 		this.url.searchParams.append(column, `ilike.${pattern}`);
@@ -30701,6 +31999,8 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param patterns - The patterns to match with
+	*
+	* @category Database
 	*/
 	ilikeAllOf(column, patterns) {
 		this.url.searchParams.append(column, `ilike(all).{${patterns.join(",")}}`);
@@ -30711,6 +32011,8 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param patterns - The patterns to match with
+	*
+	* @category Database
 	*/
 	ilikeAnyOf(column, patterns) {
 		this.url.searchParams.append(column, `ilike(any).{${patterns.join(",")}}`);
@@ -30749,6 +32051,47 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param value - The value to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription Checking for nullness, true or false
+	* Using the `eq()` filter doesn't work when filtering for `null`.
+	*
+	* Instead, you need to use `is()`.
+	*
+	* @example Checking for nullness, true or false
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .is('name', null)
+	* ```
+	*
+	* @exampleSql Checking for nullness, true or false
+	* ```sql
+	* create table
+	*   countries (id int8 primary key, name text);
+	*
+	* insert into
+	*   countries (id, name)
+	* values
+	*   (1, 'null'),
+	*   (2, null);
+	* ```
+	*
+	* @exampleResponse Checking for nullness, true or false
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 2,
+	*       "name": "null"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	is(column, value) {
 		this.url.searchParams.append(column, `is.${value}`);
@@ -30773,6 +32116,47 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The column to filter on
 	* @param values - The values array to filter with
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .in('name', ['Leia', 'Han'])
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 2,
+	*       "name": "Leia"
+	*     },
+	*     {
+	*       "id": 3,
+	*       "name": "Han"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	in(column, values) {
 		const cleanedValues = Array.from(new Set(values)).map((s) => {
@@ -30802,6 +32186,127 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The jsonb, array, or range column to filter on
 	* @param value - The jsonb, array, or range value to filter with
+	*
+	* @category Database
+	*
+	* @example On array columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('issues')
+	*   .select()
+	*   .contains('tags', ['is:open', 'priority:low'])
+	* ```
+	*
+	* @exampleSql On array columns
+	* ```sql
+	* create table
+	*   issues (
+	*     id int8 primary key,
+	*     title text,
+	*     tags text[]
+	*   );
+	*
+	* insert into
+	*   issues (id, title, tags)
+	* values
+	*   (1, 'Cache invalidation is not working', array['is:open', 'severity:high', 'priority:low']),
+	*   (2, 'Use better names', array['is:open', 'severity:low', 'priority:medium']);
+	* ```
+	*
+	* @exampleResponse On array columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "title": "Cache invalidation is not working"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription On range columns
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example On range columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .contains('during', '[2000-01-01 13:00, 2000-01-01 13:30)')
+	* ```
+	*
+	* @exampleSql On range columns
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse On range columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "room_name": "Emerald",
+	*       "during": "[\"2000-01-01 13:00:00\",\"2000-01-01 15:00:00\")"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example On `jsonb` columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('users')
+	*   .select('name')
+	*   .contains('address', { postcode: 90210 })
+	* ```
+	*
+	* @exampleSql On `jsonb` columns
+	* ```sql
+	* create table
+	*   users (
+	*     id int8 primary key,
+	*     name text,
+	*     address jsonb
+	*   );
+	*
+	* insert into
+	*   users (id, name, address)
+	* values
+	*   (1, 'Michael', '{ "postcode": 90210, "street": "Melrose Place" }'),
+	*   (2, 'Jane', '{}');
+	* ```
+	*
+	* @exampleResponse On `jsonb` columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Michael"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	contains(column, value) {
 		if (typeof value === "string") this.url.searchParams.append(column, `cs.${value}`);
@@ -30815,6 +32320,128 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The jsonb, array, or range column to filter on
 	* @param value - The jsonb, array, or range value to filter with
+	*
+	* @category Database
+	*
+	* @example On array columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('classes')
+	*   .select('name')
+	*   .containedBy('days', ['monday', 'tuesday', 'wednesday', 'friday'])
+	* ```
+	*
+	* @exampleSql On array columns
+	* ```sql
+	* create table
+	*   classes (
+	*     id int8 primary key,
+	*     name text,
+	*     days text[]
+	*   );
+	*
+	* insert into
+	*   classes (id, name, days)
+	* values
+	*   (1, 'Chemistry', array['monday', 'friday']),
+	*   (2, 'History', array['monday', 'wednesday', 'thursday']);
+	* ```
+	*
+	* @exampleResponse On array columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Chemistry"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription On range columns
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example On range columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .containedBy('during', '[2000-01-01 00:00, 2000-01-01 23:59)')
+	* ```
+	*
+	* @exampleSql On range columns
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse On range columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "room_name": "Emerald",
+	*       "during": "[\"2000-01-01 13:00:00\",\"2000-01-01 15:00:00\")"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example On `jsonb` columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('users')
+	*   .select('name')
+	*   .containedBy('address', {})
+	* ```
+	*
+	* @exampleSql On `jsonb` columns
+	* ```sql
+	* create table
+	*   users (
+	*     id int8 primary key,
+	*     name text,
+	*     address jsonb
+	*   );
+	*
+	* insert into
+	*   users (id, name, address)
+	* values
+	*   (1, 'Michael', '{ "postcode": 90210, "street": "Melrose Place" }'),
+	*   (2, 'Jane', '{}');
+	* ```
+	*
+	* @exampleResponse On `jsonb` columns
+	* ```json
+	*   {
+	*     "data": [
+	*       {
+	*         "name": "Jane"
+	*       }
+	*     ],
+	*     "status": 200,
+	*     "statusText": "OK"
+	*   }
+	*
+	* ```
 	*/
 	containedBy(column, value) {
 		if (typeof value === "string") this.url.searchParams.append(column, `cd.${value}`);
@@ -30828,6 +32455,54 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The range column to filter on
 	* @param range - The range to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription With `select()`
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .rangeGt('during', '[2000-01-02 08:00, 2000-01-02 09:00)')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	*   {
+	*     "data": [
+	*       {
+	*         "id": 2,
+	*         "room_name": "Topaz",
+	*         "during": "[\"2000-01-02 09:00:00\",\"2000-01-02 10:00:00\")"
+	*       }
+	*     ],
+	*     "status": 200,
+	*     "statusText": "OK"
+	*   }
+	*
+	* ```
 	*/
 	rangeGt(column, range) {
 		this.url.searchParams.append(column, `sr.${range}`);
@@ -30840,6 +32515,54 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The range column to filter on
 	* @param range - The range to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription With `select()`
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .rangeGte('during', '[2000-01-02 08:30, 2000-01-02 09:30)')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	*   {
+	*     "data": [
+	*       {
+	*         "id": 2,
+	*         "room_name": "Topaz",
+	*         "during": "[\"2000-01-02 09:00:00\",\"2000-01-02 10:00:00\")"
+	*       }
+	*     ],
+	*     "status": 200,
+	*     "statusText": "OK"
+	*   }
+	*
+	* ```
 	*/
 	rangeGte(column, range) {
 		this.url.searchParams.append(column, `nxl.${range}`);
@@ -30851,6 +32574,53 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The range column to filter on
 	* @param range - The range to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription With `select()`
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .rangeLt('during', '[2000-01-01 15:00, 2000-01-01 16:00)')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "room_name": "Emerald",
+	*       "during": "[\"2000-01-01 13:00:00\",\"2000-01-01 15:00:00\")"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	rangeLt(column, range) {
 		this.url.searchParams.append(column, `sl.${range}`);
@@ -30863,6 +32633,54 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The range column to filter on
 	* @param range - The range to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription With `select()`
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .rangeLte('during', '[2000-01-01 14:00, 2000-01-01 16:00)')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	*   {
+	*     "data": [
+	*       {
+	*         "id": 1,
+	*         "room_name": "Emerald",
+	*         "during": "[\"2000-01-01 13:00:00\",\"2000-01-01 15:00:00\")"
+	*       }
+	*     ],
+	*     "status": 200,
+	*     "statusText": "OK"
+	*   }
+	*
+	* ```
 	*/
 	rangeLte(column, range) {
 		this.url.searchParams.append(column, `nxr.${range}`);
@@ -30875,6 +32693,53 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The range column to filter on
 	* @param range - The range to filter with
+	*
+	* @category Database
+	*
+	* @exampleDescription With `select()`
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .rangeAdjacent('during', '[2000-01-01 12:00, 2000-01-01 13:00)')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "room_name": "Emerald",
+	*       "during": "[\"2000-01-01 13:00:00\",\"2000-01-01 15:00:00\")"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	rangeAdjacent(column, range) {
 		this.url.searchParams.append(column, `adj.${range}`);
@@ -30886,6 +32751,90 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param column - The array or range column to filter on
 	* @param value - The array or range value to filter with
+	*
+	* @category Database
+	*
+	* @example On array columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('issues')
+	*   .select('title')
+	*   .overlaps('tags', ['is:closed', 'severity:high'])
+	* ```
+	*
+	* @exampleSql On array columns
+	* ```sql
+	* create table
+	*   issues (
+	*     id int8 primary key,
+	*     title text,
+	*     tags text[]
+	*   );
+	*
+	* insert into
+	*   issues (id, title, tags)
+	* values
+	*   (1, 'Cache invalidation is not working', array['is:open', 'severity:high', 'priority:low']),
+	*   (2, 'Use better names', array['is:open', 'severity:low', 'priority:medium']);
+	* ```
+	*
+	* @exampleResponse On array columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "title": "Cache invalidation is not working"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription On range columns
+	* Postgres supports a number of [range
+	* types](https://www.postgresql.org/docs/current/rangetypes.html). You
+	* can filter on range columns using the string representation of range
+	* values.
+	*
+	* @example On range columns
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('reservations')
+	*   .select()
+	*   .overlaps('during', '[2000-01-01 12:45, 2000-01-01 13:15)')
+	* ```
+	*
+	* @exampleSql On range columns
+	* ```sql
+	* create table
+	*   reservations (
+	*     id int8 primary key,
+	*     room_name text,
+	*     during tsrange
+	*   );
+	*
+	* insert into
+	*   reservations (id, room_name, during)
+	* values
+	*   (1, 'Emerald', '[2000-01-01 13:00, 2000-01-01 15:00)'),
+	*   (2, 'Topaz', '[2000-01-02 09:00, 2000-01-02 10:00)');
+	* ```
+	*
+	* @exampleResponse On range columns
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "room_name": "Emerald",
+	*       "during": "[\"2000-01-01 13:00:00\",\"2000-01-01 15:00:00\")"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	overlaps(column, value) {
 		if (typeof value === "string") this.url.searchParams.append(column, `ov.${value}`);
@@ -30901,6 +32850,99 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	* @param options - Named parameters
 	* @param options.config - The text search configuration to use
 	* @param options.type - Change how the `query` text is interpreted
+	*
+	* @category Database
+	*
+	* @remarks
+	* - For more information, see [Postgres full text search](/docs/guides/database/full-text-search).
+	*
+	* @example Text search
+	* ```ts
+	* const result = await supabase
+	*   .from("texts")
+	*   .select("content")
+	*   .textSearch("content", `'eggs' & 'ham'`, {
+	*     config: "english",
+	*   });
+	* ```
+	*
+	* @exampleSql Text search
+	* ```sql
+	* create table texts (
+	*   id      bigint
+	*           primary key
+	*           generated always as identity,
+	*   content text
+	* );
+	*
+	* insert into texts (content) values
+	*     ('Four score and seven years ago'),
+	*     ('The road goes ever on and on'),
+	*     ('Green eggs and ham')
+	* ;
+	* ```
+	*
+	* @exampleResponse Text search
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "content": "Green eggs and ham"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription Basic normalization
+	* Uses PostgreSQL's `plainto_tsquery` function.
+	*
+	* @example Basic normalization
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('quotes')
+	*   .select('catchphrase')
+	*   .textSearch('catchphrase', `'fat' & 'cat'`, {
+	*     type: 'plain',
+	*     config: 'english'
+	*   })
+	* ```
+	*
+	* @exampleDescription Full normalization
+	* Uses PostgreSQL's `phraseto_tsquery` function.
+	*
+	* @example Full normalization
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('quotes')
+	*   .select('catchphrase')
+	*   .textSearch('catchphrase', `'fat' & 'cat'`, {
+	*     type: 'phrase',
+	*     config: 'english'
+	*   })
+	* ```
+	*
+	* @exampleDescription Websearch
+	* Uses PostgreSQL's `websearch_to_tsquery` function.
+	* This function will never raise syntax errors, which makes it possible to use raw user-supplied input for search, and can be used
+	* with advanced operators.
+	*
+	* - `unquoted text`: text not inside quote marks will be converted to terms separated by & operators, as if processed by plainto_tsquery.
+	* - `"quoted text"`: text inside quote marks will be converted to terms separated by `<->` operators, as if processed by phraseto_tsquery.
+	* - `OR`: the word “or” will be converted to the | operator.
+	* - `-`: a dash will be converted to the ! operator.
+	*
+	* @example Websearch
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('quotes')
+	*   .select('catchphrase')
+	*   .textSearch('catchphrase', `'fat or cat'`, {
+	*     type: 'websearch',
+	*     config: 'english'
+	*   })
+	* ```
 	*/
 	textSearch(column, query, { config, type } = {}) {
 		let typePart = "";
@@ -30917,9 +32959,45 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	*
 	* @param query - The object to filter with, with column names as keys mapped
 	* to their filter values
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('name')
+	*   .match({ id: 2, name: 'Leia' })
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Leia"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	match(query) {
-		Object.entries(query).forEach(([column, value]) => {
+		Object.entries(query).filter(([_, value]) => value !== void 0).forEach(([column, value]) => {
 			this.url.searchParams.append(column, `eq.${value}`);
 		});
 		return this;
@@ -30936,6 +33014,51 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	* @param operator - The operator to be negated to filter with, following
 	* PostgREST syntax
 	* @param value - The value to filter with, following PostgREST syntax
+	*
+	* @category Database
+	*
+	* @remarks
+	* not() expects you to use the raw PostgREST syntax for the filter values.
+	*
+	* ```ts
+	* .not('id', 'in', '(5,6,7)')  // Use `()` for `in` filter
+	* .not('arraycol', 'cs', '{"a","b"}')  // Use `cs` for `contains()`, `{}` for array values
+	* ```
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('countries')
+	*   .select()
+	*   .not('name', 'is', null)
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   countries (id int8 primary key, name text);
+	*
+	* insert into
+	*   countries (id, name)
+	* values
+	*   (1, 'null'),
+	*   (2, null);
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	*   {
+	*     "data": [
+	*       {
+	*         "id": 1,
+	*         "name": "null"
+	*       }
+	*     ],
+	*     "status": 200,
+	*     "statusText": "OK"
+	*   }
+	*
+	* ```
 	*/
 	not(column, operator, value) {
 		this.url.searchParams.append(column, `not.${operator}.${value}`);
@@ -30955,6 +33078,141 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	* @param options.referencedTable - Set this to filter on referenced tables
 	* instead of the parent table
 	* @param options.foreignTable - Deprecated, use `referencedTable` instead
+	*
+	* @category Database
+	*
+	* @remarks
+	* or() expects you to use the raw PostgREST syntax for the filter names and values.
+	*
+	* ```ts
+	* .or('id.in.(5,6,7), arraycol.cs.{"a","b"}')  // Use `()` for `in` filter, `{}` for array values and `cs` for `contains()`.
+	* .or('id.in.(5,6,7), arraycol.cd.{"a","b"}')  // Use `cd` for `containedBy()`
+	* ```
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('name')
+	*   .or('id.eq.2,name.eq.Han')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Leia"
+	*     },
+	*     {
+	*       "name": "Han"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example Use `or` with `and`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select('name')
+	*   .or('id.gt.3,and(id.eq.1,name.eq.Luke)')
+	* ```
+	*
+	* @exampleSql Use `or` with `and`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse Use `or` with `and`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "Luke"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example Use `or` on referenced tables
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('orchestral_sections')
+	*   .select(`
+	*     name,
+	*     instruments!inner (
+	*       name
+	*     )
+	*   `)
+	*   .or('section_id.eq.1,name.eq.guzheng', { referencedTable: 'instruments' })
+	* ```
+	*
+	* @exampleSql Use `or` on referenced tables
+	* ```sql
+	* create table
+	*   orchestral_sections (id int8 primary key, name text);
+	* create table
+	*   instruments (
+	*     id int8 primary key,
+	*     section_id int8 not null references orchestral_sections,
+	*     name text
+	*   );
+	*
+	* insert into
+	*   orchestral_sections (id, name)
+	* values
+	*   (1, 'strings'),
+	*   (2, 'woodwinds');
+	* insert into
+	*   instruments (id, section_id, name)
+	* values
+	*   (1, 2, 'flute'),
+	*   (2, 1, 'violin');
+	* ```
+	*
+	* @exampleResponse Use `or` on referenced tables
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "strings",
+	*       "instruments": [
+	*         {
+	*           "name": "violin"
+	*         }
+	*       ]
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	or(filters, { foreignTable, referencedTable = foreignTable } = {}) {
 		const key = referencedTable ? `${referencedTable}.or` : "or";
@@ -30973,6 +33231,105 @@ var PostgrestFilterBuilder = class extends PostgrestTransformBuilder {
 	* @param column - The column to filter on
 	* @param operator - The operator to filter with, following PostgREST syntax
 	* @param value - The value to filter with, following PostgREST syntax
+	*
+	* @category Database
+	*
+	* @remarks
+	* filter() expects you to use the raw PostgREST syntax for the filter values.
+	*
+	* ```ts
+	* .filter('id', 'in', '(5,6,7)')  // Use `()` for `in` filter
+	* .filter('arraycol', 'cs', '{"a","b"}')  // Use `cs` for `contains()`, `{}` for array values
+	* ```
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .filter('name', 'in', '("Han","Yoda")')
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text);
+	*
+	* insert into
+	*   characters (id, name)
+	* values
+	*   (1, 'Luke'),
+	*   (2, 'Leia'),
+	*   (3, 'Han');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 3,
+	*       "name": "Han"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example On a referenced table
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('orchestral_sections')
+	*   .select(`
+	*     name,
+	*     instruments!inner (
+	*       name
+	*     )
+	*   `)
+	*   .filter('instruments.name', 'eq', 'flute')
+	* ```
+	*
+	* @exampleSql On a referenced table
+	* ```sql
+	* create table
+	*   orchestral_sections (id int8 primary key, name text);
+	* create table
+	*    instruments (
+	*     id int8 primary key,
+	*     section_id int8 not null references orchestral_sections,
+	*     name text
+	*   );
+	*
+	* insert into
+	*   orchestral_sections (id, name)
+	* values
+	*   (1, 'strings'),
+	*   (2, 'woodwinds');
+	* insert into
+	*   instruments (id, section_id, name)
+	* values
+	*   (1, 2, 'flute'),
+	*   (2, 1, 'violin');
+	* ```
+	*
+	* @exampleResponse On a referenced table
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "name": "woodwinds",
+	*       "instruments": [
+	*         {
+	*           "name": "flute"
+	*         }
+	*       ]
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
 	*/
 	filter(column, operator, value) {
 		this.url.searchParams.append(column, `${operator}.${value}`);
@@ -30988,7 +33345,19 @@ var PostgrestQueryBuilder = class {
 	*
 	* @example
 	* ```ts
-	* import PostgrestQueryBuilder from '@supabase/postgrest-js'
+	* import { PostgrestQueryBuilder } from '@supabase/postgrest-js'
+	*
+	* const query = new PostgrestQueryBuilder(
+	*   new URL('https://xyzcompany.supabase.co/rest/v1/users'),
+	*   { headers: { apikey: 'public-anon-key' } }
+	* )
+	* ```
+	*
+	* @category Database
+	*
+	* @example Example 1
+	* ```ts
+	* import { PostgrestQueryBuilder } from '@supabase/postgrest-js'
 	*
 	* const query = new PostgrestQueryBuilder(
 	*   new URL('https://xyzcompany.supabase.co/rest/v1/users'),
@@ -32351,6 +34720,105 @@ var PostgrestQueryBuilder = class {
 	*
 	* `"estimated"`: Uses exact count for low numbers and planned count for high
 	* numbers.
+	*
+	* @category Database
+	*
+	* @remarks
+	* - `delete()` should always be combined with [filters](/docs/reference/javascript/using-filters) to target the item(s) you wish to delete.
+	* - If you use `delete()` with filters and you have
+	*   [RLS](/docs/learn/auth-deep-dive/auth-row-level-security) enabled, only
+	*   rows visible through `SELECT` policies are deleted. Note that by default
+	*   no rows are visible, so you need at least one `SELECT`/`ALL` policy that
+	*   makes the rows visible.
+	* - When using `delete().in()`, specify an array of values to target multiple rows with a single query. This is particularly useful for batch deleting entries that share common criteria, such as deleting users by their IDs. Ensure that the array you provide accurately represents all records you intend to delete to avoid unintended data removal.
+	*
+	* @example Delete a single record
+	* ```ts
+	* const response = await supabase
+	*   .from('countries')
+	*   .delete()
+	*   .eq('id', 1)
+	* ```
+	*
+	* @exampleSql Delete a single record
+	* ```sql
+	* create table
+	*   countries (id int8 primary key, name text);
+	*
+	* insert into
+	*   countries (id, name)
+	* values
+	*   (1, 'Mordor');
+	* ```
+	*
+	* @exampleResponse Delete a single record
+	* ```json
+	* {
+	*   "status": 204,
+	*   "statusText": "No Content"
+	* }
+	* ```
+	*
+	* @example Delete a record and return it
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('countries')
+	*   .delete()
+	*   .eq('id', 1)
+	*   .select()
+	* ```
+	*
+	* @exampleSql Delete a record and return it
+	* ```sql
+	* create table
+	*   countries (id int8 primary key, name text);
+	*
+	* insert into
+	*   countries (id, name)
+	* values
+	*   (1, 'Mordor');
+	* ```
+	*
+	* @exampleResponse Delete a record and return it
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Mordor"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example Delete multiple records
+	* ```ts
+	* const response = await supabase
+	*   .from('countries')
+	*   .delete()
+	*   .in('id', [1, 2, 3])
+	* ```
+	*
+	* @exampleSql Delete multiple records
+	* ```sql
+	* create table
+	*   countries (id int8 primary key, name text);
+	*
+	* insert into
+	*   countries (id, name)
+	* values
+	*   (1, 'Rohan'), (2, 'The Shire'), (3, 'Mordor');
+	* ```
+	*
+	* @exampleResponse Delete multiple records
+	* ```json
+	* {
+	*   "status": 204,
+	*   "statusText": "No Content"
+	* }
+	* ```
 	*/
 	delete({ count } = {}) {
 		var _this$fetch4;
@@ -32459,7 +34927,34 @@ var PostgrestClient = class PostgrestClient {
 	* @param options.urlLengthLimit - Maximum URL length in characters before warnings/errors are triggered. Defaults to 8000.
 	* @example
 	* ```ts
-	* import PostgrestClient from '@supabase/postgrest-js'
+	* import { PostgrestClient } from '@supabase/postgrest-js'
+	*
+	* const postgrest = new PostgrestClient('https://xyzcompany.supabase.co/rest/v1', {
+	*   headers: { apikey: 'public-anon-key' },
+	*   schema: 'public',
+	*   timeout: 30000, // 30 second timeout
+	* })
+	* ```
+	*
+	* @category Database
+	*
+	* @remarks
+	* - A `timeout` option (in milliseconds) can be set to automatically abort requests that take too long.
+	* - A `urlLengthLimit` option (default: 8000) can be set to control when URL length warnings are included in error messages for aborted requests.
+	*
+	* @example Example 1
+	* ```ts
+	* import { PostgrestClient } from '@supabase/postgrest-js'
+	*
+	* const postgrest = new PostgrestClient('https://xyzcompany.supabase.co/rest/v1', {
+	*   headers: { apikey: 'public-anon-key' },
+	*   schema: 'public',
+	* })
+	* ```
+	*
+	* @example With timeout
+	* ```ts
+	* import { PostgrestClient } from '@supabase/postgrest-js'
 	*
 	* const postgrest = new PostgrestClient('https://xyzcompany.supabase.co/rest/v1', {
 	*   headers: { apikey: 'public-anon-key' },
@@ -32501,6 +34996,8 @@ var PostgrestClient = class PostgrestClient {
 	* Perform a query on a table or a view.
 	*
 	* @param relation - The table or view name to query
+	*
+	* @category Database
 	*/
 	from(relation) {
 		if (!relation || typeof relation !== "string" || relation.trim() === "") throw new Error("Invalid relation name: relation must be a non-empty string.");
@@ -32517,6 +35014,8 @@ var PostgrestClient = class PostgrestClient {
 	* The schema needs to be on the list of exposed schemas inside Supabase.
 	*
 	* @param schema - The schema to query
+	*
+	* @category Database
 	*/
 	schema(schema) {
 		return new PostgrestClient(this.url, {
@@ -32556,6 +35055,139 @@ var PostgrestClient = class PostgrestClient {
 	*   .schema('schema_b')
 	*   .rpc('function_a', {})
 	*   .overrideTypes<{ id: string; user_id: string }[]>()
+	* ```
+	*
+	* @category Database
+	*
+	* @example Call a Postgres function without arguments
+	* ```ts
+	* const { data, error } = await supabase.rpc('hello_world')
+	* ```
+	*
+	* @exampleSql Call a Postgres function without arguments
+	* ```sql
+	* create function hello_world() returns text as $$
+	*   select 'Hello world';
+	* $$ language sql;
+	* ```
+	*
+	* @exampleResponse Call a Postgres function without arguments
+	* ```json
+	* {
+	*   "data": "Hello world",
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example Call a Postgres function with arguments
+	* ```ts
+	* const { data, error } = await supabase.rpc('echo', { say: '👋' })
+	* ```
+	*
+	* @exampleSql Call a Postgres function with arguments
+	* ```sql
+	* create function echo(say text) returns text as $$
+	*   select say;
+	* $$ language sql;
+	* ```
+	*
+	* @exampleResponse Call a Postgres function with arguments
+	* ```json
+	*   {
+	*     "data": "👋",
+	*     "status": 200,
+	*     "statusText": "OK"
+	*   }
+	*
+	* ```
+	*
+	* @exampleDescription Bulk processing
+	* You can process large payloads by passing in an array as an argument.
+	*
+	* @example Bulk processing
+	* ```ts
+	* const { data, error } = await supabase.rpc('add_one_each', { arr: [1, 2, 3] })
+	* ```
+	*
+	* @exampleSql Bulk processing
+	* ```sql
+	* create function add_one_each(arr int[]) returns int[] as $$
+	*   select array_agg(n + 1) from unnest(arr) as n;
+	* $$ language sql;
+	* ```
+	*
+	* @exampleResponse Bulk processing
+	* ```json
+	* {
+	*   "data": [
+	*     2,
+	*     3,
+	*     4
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @exampleDescription Call a Postgres function with filters
+	* Postgres functions that return tables can also be combined with [Filters](/docs/reference/javascript/using-filters) and [Modifiers](/docs/reference/javascript/using-modifiers).
+	*
+	* @example Call a Postgres function with filters
+	* ```ts
+	* const { data, error } = await supabase
+	*   .rpc('list_stored_countries')
+	*   .eq('id', 1)
+	*   .single()
+	* ```
+	*
+	* @exampleSql Call a Postgres function with filters
+	* ```sql
+	* create table
+	*   countries (id int8 primary key, name text);
+	*
+	* insert into
+	*   countries (id, name)
+	* values
+	*   (1, 'Rohan'),
+	*   (2, 'The Shire');
+	*
+	* create function list_stored_countries() returns setof countries as $$
+	*   select * from countries;
+	* $$ language sql;
+	* ```
+	*
+	* @exampleResponse Call a Postgres function with filters
+	* ```json
+	* {
+	*   "data": {
+	*     "id": 1,
+	*     "name": "Rohan"
+	*   },
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*
+	* @example Call a read-only Postgres function
+	* ```ts
+	* const { data, error } = await supabase.rpc('hello_world', undefined, { get: true })
+	* ```
+	*
+	* @exampleSql Call a read-only Postgres function
+	* ```sql
+	* create function hello_world() returns text as $$
+	*   select 'Hello world';
+	* $$ language sql;
+	* ```
+	*
+	* @exampleResponse Call a read-only Postgres function
+	* ```json
+	* {
+	*   "data": "Hello world",
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
 	* ```
 	*/
 	rpc(fn, args = {}, { head = false, get = false, count } = {}) {
@@ -33459,25 +36091,17 @@ const _getErrorMessage = (err) => {
 * @param namespace - Error namespace ('storage' or 'vectors')
 */
 const handleError = async (error, reject, options, namespace) => {
-	if (error && typeof error === "object" && "status" in error && "ok" in error && typeof error.status === "number") {
+	if (error !== null && typeof error === "object" && typeof error.json === "function") {
 		const responseError = error;
-		const status = responseError.status || 500;
-		if (typeof responseError.json === "function") responseError.json().then((err) => {
+		let status = parseInt(responseError.status, 10);
+		if (!Number.isFinite(status)) status = 500;
+		responseError.json().then((err) => {
 			const statusCode = (err === null || err === void 0 ? void 0 : err.statusCode) || (err === null || err === void 0 ? void 0 : err.code) || status + "";
 			reject(new StorageApiError(_getErrorMessage(err), status, statusCode, namespace));
 		}).catch(() => {
-			if (namespace === "vectors") {
-				const statusCode = status + "";
-				reject(new StorageApiError(responseError.statusText || `HTTP ${status} error`, status, statusCode, namespace));
-			} else {
-				const statusCode = status + "";
-				reject(new StorageApiError(responseError.statusText || `HTTP ${status} error`, status, statusCode, namespace));
-			}
-		});
-		else {
 			const statusCode = status + "";
 			reject(new StorageApiError(responseError.statusText || `HTTP ${status} error`, status, statusCode, namespace));
-		}
+		});
 	} else reject(new StorageUnknownError(_getErrorMessage(error), error, namespace));
 };
 /**
@@ -34564,7 +37188,7 @@ var StorageFileApi = class extends BaseApiClient {
 
 //#endregion
 //#region src/lib/version.ts
-const version = "2.100.0-canary.0";
+const version = "2.100.0";
 
 //#endregion
 //#region src/lib/constants.ts
@@ -35928,7 +38552,7 @@ var auth_js_dist_main = __nccwpck_require__(6748);
 
 
 //#region src/lib/version.ts
-const dist_version = "2.100.0-canary.0";
+const dist_version = "2.100.0";
 
 //#endregion
 //#region src/lib/constants.ts
