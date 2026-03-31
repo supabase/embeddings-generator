@@ -10031,7 +10031,7 @@ exports.version = void 0;
 // - Debugging and support (identifying which version is running)
 // - Telemetry and logging (version reporting in errors/analytics)
 // - Ensuring build artifacts match the published package version
-exports.version = '2.100.1';
+exports.version = '2.101.1';
 //# sourceMappingURL=version.js.map
 
 /***/ }),
@@ -14671,9 +14671,11 @@ class RealtimeChannel {
      * ```
      */
     on(type, filter, callback) {
-        if (this.channelAdapter.isJoined() && type === REALTIME_LISTEN_TYPES.PRESENCE) {
-            this.socket.log('channel', `cannot add presence callbacks for ${this.topic} after joining.`);
-            throw new Error('cannot add presence callbacks after joining a channel');
+        const stateCheck = this.channelAdapter.isJoined() || this.channelAdapter.isJoining();
+        const typeCheck = type === REALTIME_LISTEN_TYPES.PRESENCE || type === REALTIME_LISTEN_TYPES.POSTGRES_CHANGES;
+        if (stateCheck && typeCheck) {
+            this.socket.log('channel', `cannot add \`${type}\` callbacks for ${this.topic} after \`subscribe()\`.`);
+            throw new Error(`cannot add \`${type}\` callbacks for ${this.topic} after \`subscribe()\`.`);
         }
         return this._on(type, filter, callback);
     }
@@ -14961,6 +14963,16 @@ class RealtimeChannel {
             }
             return payload;
         });
+    }
+    copyBindings(other) {
+        if (this.joinedOnce) {
+            throw new Error('cannot copy bindings into joined channel');
+        }
+        for (const kind in other.bindings) {
+            for (const binding of other.bindings[kind]) {
+                this._on(binding.type, binding.filter, binding.callback);
+            }
+        }
     }
     /**
      * Compares two optional filter values for equality.
@@ -16166,7 +16178,7 @@ exports.version = void 0;
 // - Debugging and support (identifying which version is running)
 // - Telemetry and logging (version reporting in errors/analytics)
 // - Ensuring build artifacts match the published package version
-exports.version = '2.100.1';
+exports.version = '2.101.1';
 //# sourceMappingURL=version.js.map
 
 /***/ }),
@@ -39642,7 +39654,7 @@ var StorageFileApi = class extends BaseApiClient {
 
 //#endregion
 //#region src/lib/version.ts
-const version = "2.100.1";
+const version = "2.101.1";
 
 //#endregion
 //#region src/lib/constants.ts
@@ -41053,7 +41065,7 @@ var auth_js_dist_main = __nccwpck_require__(6748);
 
 
 //#region src/lib/version.ts
-const dist_version = "2.100.1";
+const dist_version = "2.101.1";
 
 //#endregion
 //#region src/lib/constants.ts
