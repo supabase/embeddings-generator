@@ -6885,7 +6885,12 @@ class GoTrueClient {
             catch (err) {
                 await ((_b = this.stateChangeEmitters.get(id)) === null || _b === void 0 ? void 0 : _b.callback('INITIAL_SESSION', null));
                 this._debug('INITIAL_SESSION', 'callback id', id, 'error', err);
-                console.error(err);
+                if ((0, errors_1.isAuthSessionMissingError)(err)) {
+                    console.warn(err);
+                }
+                else {
+                    console.error(err);
+                }
             }
         });
     }
@@ -10031,7 +10036,7 @@ exports.version = void 0;
 // - Debugging and support (identifying which version is running)
 // - Telemetry and logging (version reporting in errors/analytics)
 // - Ensuring build artifacts match the published package version
-exports.version = '2.100.1';
+exports.version = '2.103.0';
 //# sourceMappingURL=version.js.map
 
 /***/ }),
@@ -11932,6 +11937,13 @@ class FunctionsError extends Error {
         super(message);
         this.name = name;
         this.context = context;
+    }
+    toJSON() {
+        return {
+            name: this.name,
+            message: this.message,
+            context: this.context,
+        };
     }
 }
 exports.FunctionsError = FunctionsError;
@@ -14671,9 +14683,11 @@ class RealtimeChannel {
      * ```
      */
     on(type, filter, callback) {
-        if (this.channelAdapter.isJoined() && type === REALTIME_LISTEN_TYPES.PRESENCE) {
-            this.socket.log('channel', `cannot add presence callbacks for ${this.topic} after joining.`);
-            throw new Error('cannot add presence callbacks after joining a channel');
+        const stateCheck = this.channelAdapter.isJoined() || this.channelAdapter.isJoining();
+        const typeCheck = type === REALTIME_LISTEN_TYPES.PRESENCE || type === REALTIME_LISTEN_TYPES.POSTGRES_CHANGES;
+        if (stateCheck && typeCheck) {
+            this.socket.log('channel', `cannot add \`${type}\` callbacks for ${this.topic} after \`subscribe()\`.`);
+            throw new Error(`cannot add \`${type}\` callbacks for ${this.topic} after \`subscribe()\`.`);
         }
         return this._on(type, filter, callback);
     }
@@ -14961,6 +14975,16 @@ class RealtimeChannel {
             }
             return payload;
         });
+    }
+    copyBindings(other) {
+        if (this.joinedOnce) {
+            throw new Error('cannot copy bindings into joined channel');
+        }
+        for (const kind in other.bindings) {
+            for (const binding of other.bindings[kind]) {
+                this._on(binding.type, binding.filter, binding.callback);
+            }
+        }
     }
     /**
      * Compares two optional filter values for equality.
@@ -16166,7 +16190,7 @@ exports.version = void 0;
 // - Debugging and support (identifying which version is running)
 // - Telemetry and logging (version reporting in errors/analytics)
 // - Ensuring build artifacts match the published package version
-exports.version = '2.100.1';
+exports.version = '2.103.0';
 //# sourceMappingURL=version.js.map
 
 /***/ }),
@@ -32843,6 +32867,35 @@ var core = __nccwpck_require__(2186);
 // EXTERNAL MODULE: ./node_modules/@supabase/functions-js/dist/main/index.js
 var main = __nccwpck_require__(8519);
 ;// CONCATENATED MODULE: ./node_modules/@supabase/postgrest-js/dist/index.mjs
+//#region src/types/common/common.ts
+/**
+* Default number of retry attempts.
+*/
+const DEFAULT_MAX_RETRIES = 3;
+/**
+* Default exponential backoff delay function.
+* Delays: 1s, 2s, 4s, 8s, ... (max 30s)
+*
+* @param attemptIndex - Zero-based index of the retry attempt
+* @returns Delay in milliseconds before the next retry
+*/
+const getRetryDelay = (attemptIndex) => Math.min(1e3 * 2 ** attemptIndex, 3e4);
+/**
+* Status codes that are safe to retry.
+* 520 = Cloudflare timeout/connection errors (transient)
+* 503 = PostgREST schema cache not yet loaded (transient, signals retry via Retry-After header)
+*/
+const RETRYABLE_STATUS_CODES = [520, 503];
+/**
+* HTTP methods that are safe to retry (idempotent operations).
+*/
+const RETRYABLE_METHODS = [
+	"GET",
+	"HEAD",
+	"OPTIONS"
+];
+
+//#endregion
 //#region src/PostgrestError.ts
 /**
 * Error format
@@ -32870,10 +32923,49 @@ var PostgrestError = class extends Error {
 		this.hint = context.hint;
 		this.code = context.code;
 	}
+	toJSON() {
+		return {
+			name: this.name,
+			message: this.message,
+			details: this.details,
+			hint: this.hint,
+			code: this.code
+		};
+	}
 };
 
 //#endregion
 //#region src/PostgrestBuilder.ts
+/**
+* Sleep for a given number of milliseconds.
+* If an AbortSignal is provided, the sleep resolves early when the signal is aborted.
+*/
+function sleep(ms, signal) {
+	return new Promise((resolve) => {
+		if (signal === null || signal === void 0 ? void 0 : signal.aborted) {
+			resolve();
+			return;
+		}
+		const id = setTimeout(() => {
+			signal === null || signal === void 0 || signal.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		function onAbort() {
+			clearTimeout(id);
+			resolve();
+		}
+		signal === null || signal === void 0 || signal.addEventListener("abort", onAbort);
+	});
+}
+/**
+* Check if a request should be retried based on method and status code.
+*/
+function shouldRetry(method, status, attemptCount, retryEnabled) {
+	if (!retryEnabled || attemptCount >= DEFAULT_MAX_RETRIES) return false;
+	if (!RETRYABLE_METHODS.includes(method)) return false;
+	if (!RETRYABLE_STATUS_CODES.includes(status)) return false;
+	return true;
+}
 var PostgrestBuilder = class {
 	/**
 	* Creates a builder configured for a specific PostgREST request.
@@ -32901,8 +32993,9 @@ var PostgrestBuilder = class {
 	* ```
 	*/
 	constructor(builder) {
-		var _builder$shouldThrowO, _builder$isMaybeSingl, _builder$urlLengthLim;
+		var _builder$shouldThrowO, _builder$isMaybeSingl, _builder$shouldStripN, _builder$urlLengthLim, _builder$retry;
 		this.shouldThrowOnError = false;
+		this.retryEnabled = true;
 		this.method = builder.method;
 		this.url = builder.url;
 		this.headers = new Headers(builder.headers);
@@ -32911,7 +33004,9 @@ var PostgrestBuilder = class {
 		this.shouldThrowOnError = (_builder$shouldThrowO = builder.shouldThrowOnError) !== null && _builder$shouldThrowO !== void 0 ? _builder$shouldThrowO : false;
 		this.signal = builder.signal;
 		this.isMaybeSingle = (_builder$isMaybeSingl = builder.isMaybeSingle) !== null && _builder$isMaybeSingl !== void 0 ? _builder$isMaybeSingl : false;
+		this.shouldStripNulls = (_builder$shouldStripN = builder.shouldStripNulls) !== null && _builder$shouldStripN !== void 0 ? _builder$shouldStripN : false;
 		this.urlLengthLimit = (_builder$urlLengthLim = builder.urlLengthLimit) !== null && _builder$urlLengthLim !== void 0 ? _builder$urlLengthLim : 8e3;
+		this.retryEnabled = (_builder$retry = builder.retry) !== null && _builder$retry !== void 0 ? _builder$retry : true;
 		if (builder.fetch) this.fetch = builder.fetch;
 		else this.fetch = fetch;
 	}
@@ -32928,6 +33023,60 @@ var PostgrestBuilder = class {
 		return this;
 	}
 	/**
+	* Strip null values from the response data. Properties with `null` values
+	* will be omitted from the returned JSON objects.
+	*
+	* Requires PostgREST 11.2.0+.
+	*
+	* {@link https://docs.postgrest.org/en/stable/references/api/resource_representation.html#stripped-nulls}
+	*
+	* @category Database
+	*
+	* @example With `select()`
+	* ```ts
+	* const { data, error } = await supabase
+	*   .from('characters')
+	*   .select()
+	*   .stripNulls()
+	* ```
+	*
+	* @exampleSql With `select()`
+	* ```sql
+	* create table
+	*   characters (id int8 primary key, name text, bio text);
+	*
+	* insert into
+	*   characters (id, name, bio)
+	* values
+	*   (1, 'Luke', null),
+	*   (2, 'Leia', 'Princess of Alderaan');
+	* ```
+	*
+	* @exampleResponse With `select()`
+	* ```json
+	* {
+	*   "data": [
+	*     {
+	*       "id": 1,
+	*       "name": "Luke"
+	*     },
+	*     {
+	*       "id": 2,
+	*       "name": "Leia",
+	*       "bio": "Princess of Alderaan"
+	*     }
+	*   ],
+	*   "status": 200,
+	*   "statusText": "OK"
+	* }
+	* ```
+	*/
+	stripNulls() {
+		if (this.headers.get("Accept") === "text/csv") throw new Error("stripNulls() cannot be used with csv()");
+		this.shouldStripNulls = true;
+		return this;
+	}
+	/**
 	* Set an HTTP header for the request.
 	*
 	* @category Database
@@ -32937,77 +33086,78 @@ var PostgrestBuilder = class {
 		this.headers.set(name, value);
 		return this;
 	}
-	/**  *
+	/**
 	* @category Database
+	*
+	* Configure retry behavior for this request.
+	*
+	* By default, retries are enabled for idempotent requests (GET, HEAD, OPTIONS)
+	* that fail with network errors or specific HTTP status codes (503, 520).
+	* Retries use exponential backoff (1s, 2s, 4s) with a maximum of 3 attempts.
+	*
+	* @param enabled - Whether to enable retries for this request
+	*
+	* @example
+	* ```ts
+	* // Disable retries for a specific query
+	* const { data, error } = await supabase
+	*   .from('users')
+	*   .select()
+	*   .retry(false)
+	* ```
 	*/
+	retry(enabled) {
+		this.retryEnabled = enabled;
+		return this;
+	}
 	then(onfulfilled, onrejected) {
 		var _this = this;
 		if (this.schema === void 0) {} else if (["GET", "HEAD"].includes(this.method)) this.headers.set("Accept-Profile", this.schema);
 		else this.headers.set("Content-Profile", this.schema);
 		if (this.method !== "GET" && this.method !== "HEAD") this.headers.set("Content-Type", "application/json");
+		if (this.shouldStripNulls) {
+			const currentAccept = this.headers.get("Accept");
+			if (currentAccept === "application/vnd.pgrst.object+json") this.headers.set("Accept", "application/vnd.pgrst.object+json;nulls=stripped");
+			else if (!currentAccept || currentAccept === "application/json") this.headers.set("Accept", "application/vnd.pgrst.array+json;nulls=stripped");
+		}
 		const _fetch = this.fetch;
-		let res = _fetch(this.url.toString(), {
-			method: this.method,
-			headers: this.headers,
-			body: JSON.stringify(this.body),
-			signal: this.signal
-		}).then(async (res$1) => {
-			let error = null;
-			let data = null;
-			let count = null;
-			let status = res$1.status;
-			let statusText = res$1.statusText;
-			if (res$1.ok) {
-				var _this$headers$get2, _res$headers$get;
-				if (_this.method !== "HEAD") {
-					var _this$headers$get;
-					const body = await res$1.text();
-					if (body === "") {} else if (_this.headers.get("Accept") === "text/csv") data = body;
-					else if (_this.headers.get("Accept") && ((_this$headers$get = _this.headers.get("Accept")) === null || _this$headers$get === void 0 ? void 0 : _this$headers$get.includes("application/vnd.pgrst.plan+text"))) data = body;
-					else data = JSON.parse(body);
-				}
-				const countHeader = (_this$headers$get2 = _this.headers.get("Prefer")) === null || _this$headers$get2 === void 0 ? void 0 : _this$headers$get2.match(/count=(exact|planned|estimated)/);
-				const contentRange = (_res$headers$get = res$1.headers.get("content-range")) === null || _res$headers$get === void 0 ? void 0 : _res$headers$get.split("/");
-				if (countHeader && contentRange && contentRange.length > 1) count = parseInt(contentRange[1]);
-				if (_this.isMaybeSingle && Array.isArray(data)) if (data.length > 1) {
-					error = {
-						code: "PGRST116",
-						details: `Results contain ${data.length} rows, application/vnd.pgrst.object+json requires 1 row`,
-						hint: null,
-						message: "JSON object requested, multiple (or no) rows returned"
-					};
-					data = null;
-					count = null;
-					status = 406;
-					statusText = "Not Acceptable";
-				} else if (data.length === 1) data = data[0];
-				else data = null;
-			} else {
-				const body = await res$1.text();
+		const executeWithRetry = async () => {
+			let attemptCount = 0;
+			while (true) {
+				const requestHeaders = new Headers(_this.headers);
+				if (attemptCount > 0) requestHeaders.set("X-Retry-Count", String(attemptCount));
+				let res$1;
 				try {
-					error = JSON.parse(body);
-					if (Array.isArray(error) && res$1.status === 404) {
-						data = [];
-						error = null;
-						status = 200;
-						statusText = "OK";
+					res$1 = await _fetch(_this.url.toString(), {
+						method: _this.method,
+						headers: requestHeaders,
+						body: JSON.stringify(_this.body),
+						signal: _this.signal
+					});
+				} catch (fetchError) {
+					if ((fetchError === null || fetchError === void 0 ? void 0 : fetchError.name) === "AbortError" || (fetchError === null || fetchError === void 0 ? void 0 : fetchError.code) === "ABORT_ERR") throw fetchError;
+					if (!RETRYABLE_METHODS.includes(_this.method)) throw fetchError;
+					if (_this.retryEnabled && attemptCount < DEFAULT_MAX_RETRIES) {
+						const delay = getRetryDelay(attemptCount);
+						attemptCount++;
+						await sleep(delay, _this.signal);
+						continue;
 					}
-				} catch (_unused) {
-					if (res$1.status === 404 && body === "") {
-						status = 204;
-						statusText = "No Content";
-					} else error = { message: body };
+					throw fetchError;
 				}
-				if (error && _this.shouldThrowOnError) throw new PostgrestError(error);
+				if (shouldRetry(_this.method, res$1.status, attemptCount, _this.retryEnabled)) {
+					var _res$headers$get, _res$headers;
+					const retryAfterHeader = (_res$headers$get = (_res$headers = res$1.headers) === null || _res$headers === void 0 ? void 0 : _res$headers.get("Retry-After")) !== null && _res$headers$get !== void 0 ? _res$headers$get : null;
+					const delay = retryAfterHeader !== null ? Math.max(0, parseInt(retryAfterHeader, 10) || 0) * 1e3 : getRetryDelay(attemptCount);
+					await res$1.text();
+					attemptCount++;
+					await sleep(delay, _this.signal);
+					continue;
+				}
+				return await _this.processResponse(res$1);
 			}
-			return {
-				error,
-				data,
-				count,
-				status,
-				statusText
-			};
-		});
+		};
+		let res = executeWithRetry();
 		if (!this.shouldThrowOnError) res = res.catch((fetchError) => {
 			var _fetchError$name2;
 			let errorDetails = "";
@@ -33037,6 +33187,7 @@ var PostgrestBuilder = class {
 				if (urlLength > this.urlLengthLimit) hint += `. Your request URL is ${urlLength} characters. If selecting many fields, consider using views. If filtering with large arrays (e.g., .in('id', [200+ IDs])), consider using an RPC function instead.`;
 			}
 			return {
+				success: false,
 				error: {
 					message: `${(_fetchError$name2 = fetchError === null || fetchError === void 0 ? void 0 : fetchError.name) !== null && _fetchError$name2 !== void 0 ? _fetchError$name2 : "FetchError"}: ${fetchError === null || fetchError === void 0 ? void 0 : fetchError.message}`,
 					details: errorDetails,
@@ -33050,6 +33201,68 @@ var PostgrestBuilder = class {
 			};
 		});
 		return res.then(onfulfilled, onrejected);
+	}
+	/**
+	* Process a fetch response and return the standardized postgrest response.
+	*/
+	async processResponse(res) {
+		var _this2 = this;
+		let error = null;
+		let data = null;
+		let count = null;
+		let status = res.status;
+		let statusText = res.statusText;
+		if (res.ok) {
+			var _this$headers$get2, _res$headers$get2;
+			if (_this2.method !== "HEAD") {
+				var _this$headers$get;
+				const body = await res.text();
+				if (body === "") {} else if (_this2.headers.get("Accept") === "text/csv") data = body;
+				else if (_this2.headers.get("Accept") && ((_this$headers$get = _this2.headers.get("Accept")) === null || _this$headers$get === void 0 ? void 0 : _this$headers$get.includes("application/vnd.pgrst.plan+text"))) data = body;
+				else data = JSON.parse(body);
+			}
+			const countHeader = (_this$headers$get2 = _this2.headers.get("Prefer")) === null || _this$headers$get2 === void 0 ? void 0 : _this$headers$get2.match(/count=(exact|planned|estimated)/);
+			const contentRange = (_res$headers$get2 = res.headers.get("content-range")) === null || _res$headers$get2 === void 0 ? void 0 : _res$headers$get2.split("/");
+			if (countHeader && contentRange && contentRange.length > 1) count = parseInt(contentRange[1]);
+			if (_this2.isMaybeSingle && Array.isArray(data)) if (data.length > 1) {
+				error = {
+					code: "PGRST116",
+					details: `Results contain ${data.length} rows, application/vnd.pgrst.object+json requires 1 row`,
+					hint: null,
+					message: "JSON object requested, multiple (or no) rows returned"
+				};
+				data = null;
+				count = null;
+				status = 406;
+				statusText = "Not Acceptable";
+			} else if (data.length === 1) data = data[0];
+			else data = null;
+		} else {
+			const body = await res.text();
+			try {
+				error = JSON.parse(body);
+				if (Array.isArray(error) && res.status === 404) {
+					data = [];
+					error = null;
+					status = 200;
+					statusText = "OK";
+				}
+			} catch (_unused) {
+				if (res.status === 404 && body === "") {
+					status = 204;
+					statusText = "No Content";
+				} else error = { message: body };
+			}
+			if (error && _this2.shouldThrowOnError) throw new PostgrestError(error);
+		}
+		return {
+			success: error === null,
+			error,
+			data,
+			count,
+			status,
+			statusText
+		};
 	}
 	/**
 	* Override the type of the returned `data`.
@@ -35734,22 +35947,31 @@ var PostgrestQueryBuilder = class {
 	*
 	* @category Database
 	*
+	* @param url - The URL for the query
+	* @param options - Named parameters
+	* @param options.headers - Custom headers
+	* @param options.schema - Postgres schema to use
+	* @param options.fetch - Custom fetch implementation
+	* @param options.urlLengthLimit - Maximum URL length before warning
+	* @param options.retry - Enable automatic retries for transient errors (default: true)
+	*
 	* @example Creating a Postgrest query builder
 	* ```ts
 	* import { PostgrestQueryBuilder } from '@supabase/postgrest-js'
 	*
 	* const query = new PostgrestQueryBuilder(
 	*   new URL('https://xyzcompany.supabase.co/rest/v1/users'),
-	*   { headers: { apikey: 'public-anon-key' } }
+	*   { headers: { apikey: 'public-anon-key' }, retry: true }
 	* )
 	* ```
 	*/
-	constructor(url, { headers = {}, schema, fetch: fetch$1, urlLengthLimit = 8e3 }) {
+	constructor(url, { headers = {}, schema, fetch: fetch$1, urlLengthLimit = 8e3, retry }) {
 		this.url = url;
 		this.headers = new Headers(headers);
 		this.schema = schema;
 		this.fetch = fetch$1;
 		this.urlLengthLimit = urlLengthLimit;
+		this.retry = retry;
 	}
 	/**
 	* Clone URL and headers to prevent shared state between operations.
@@ -36557,7 +36779,8 @@ var PostgrestQueryBuilder = class {
 			headers,
 			schema: this.schema,
 			fetch: this.fetch,
-			urlLengthLimit: this.urlLengthLimit
+			urlLengthLimit: this.urlLengthLimit,
+			retry: this.retry
 		});
 	}
 	/**
@@ -36691,7 +36914,8 @@ var PostgrestQueryBuilder = class {
 			schema: this.schema,
 			body: values,
 			fetch: (_this$fetch = this.fetch) !== null && _this$fetch !== void 0 ? _this$fetch : fetch,
-			urlLengthLimit: this.urlLengthLimit
+			urlLengthLimit: this.urlLengthLimit,
+			retry: this.retry
 		});
 	}
 	/**
@@ -36924,7 +37148,8 @@ var PostgrestQueryBuilder = class {
 			schema: this.schema,
 			body: values,
 			fetch: (_this$fetch2 = this.fetch) !== null && _this$fetch2 !== void 0 ? _this$fetch2 : fetch,
-			urlLengthLimit: this.urlLengthLimit
+			urlLengthLimit: this.urlLengthLimit,
+			retry: this.retry
 		});
 	}
 	/**
@@ -37078,7 +37303,8 @@ var PostgrestQueryBuilder = class {
 			schema: this.schema,
 			body: values,
 			fetch: (_this$fetch3 = this.fetch) !== null && _this$fetch3 !== void 0 ? _this$fetch3 : fetch,
-			urlLengthLimit: this.urlLengthLimit
+			urlLengthLimit: this.urlLengthLimit,
+			retry: this.retry
 		});
 	}
 	/**
@@ -37210,7 +37436,8 @@ var PostgrestQueryBuilder = class {
 			headers,
 			schema: this.schema,
 			fetch: (_this$fetch4 = this.fetch) !== null && _this$fetch4 !== void 0 ? _this$fetch4 : fetch,
-			urlLengthLimit: this.urlLengthLimit
+			urlLengthLimit: this.urlLengthLimit,
+			retry: this.retry
 		});
 	}
 };
@@ -37304,6 +37531,10 @@ var PostgrestClient = class PostgrestClient {
 	* @param options.fetch - Custom fetch
 	* @param options.timeout - Optional timeout in milliseconds for all requests. When set, requests will automatically abort after this duration to prevent indefinite hangs.
 	* @param options.urlLengthLimit - Maximum URL length in characters before warnings/errors are triggered. Defaults to 8000.
+	* @param options.retry - Enable or disable automatic retries for transient errors.
+	*   When enabled, idempotent requests (GET, HEAD, OPTIONS) that fail with network
+	*   errors or HTTP 503/520 responses will be automatically retried up to 3 times
+	*   with exponential backoff (1s, 2s, 4s). Defaults to `true`.
 	* @example
 	* ```ts
 	* import { PostgrestClient } from '@supabase/postgrest-js'
@@ -37339,10 +37570,11 @@ var PostgrestClient = class PostgrestClient {
 	*   headers: { apikey: 'public-anon-key' },
 	*   schema: 'public',
 	*   timeout: 30000, // 30 second timeout
+	*   retry: false, // Disable automatic retries
 	* })
 	* ```
 	*/
-	constructor(url, { headers = {}, schema, fetch: fetch$1, timeout, urlLengthLimit = 8e3 } = {}) {
+	constructor(url, { headers = {}, schema, fetch: fetch$1, timeout, urlLengthLimit = 8e3, retry } = {}) {
 		this.url = url;
 		this.headers = new Headers(headers);
 		this.schemaName = schema;
@@ -37370,6 +37602,7 @@ var PostgrestClient = class PostgrestClient {
 			return originalFetch(input, _objectSpread2(_objectSpread2({}, init), {}, { signal: controller.signal })).finally(() => clearTimeout(timeoutId));
 		};
 		else this.fetch = originalFetch;
+		this.retry = retry;
 	}
 	/**
 	* Perform a query on a table or a view.
@@ -37384,7 +37617,8 @@ var PostgrestClient = class PostgrestClient {
 			headers: new Headers(this.headers),
 			schema: this.schemaName,
 			fetch: this.fetch,
-			urlLengthLimit: this.urlLengthLimit
+			urlLengthLimit: this.urlLengthLimit,
+			retry: this.retry
 		});
 	}
 	/**
@@ -37401,7 +37635,8 @@ var PostgrestClient = class PostgrestClient {
 			headers: this.headers,
 			schema,
 			fetch: this.fetch,
-			urlLengthLimit: this.urlLengthLimit
+			urlLengthLimit: this.urlLengthLimit,
+			retry: this.retry
 		});
 	}
 	/**
@@ -37598,7 +37833,8 @@ var PostgrestClient = class PostgrestClient {
 			schema: this.schemaName,
 			body,
 			fetch: (_this$fetch = this.fetch) !== null && _this$fetch !== void 0 ? _this$fetch : fetch,
-			urlLengthLimit: this.urlLengthLimit
+			urlLengthLimit: this.urlLengthLimit,
+			retry: this.retry
 		});
 	}
 };
@@ -38498,12 +38734,22 @@ const _getRequestParams = (method, options, parameters, body) => {
 	};
 	if (method === "GET" || method === "HEAD" || !body) return dist_objectSpread2(dist_objectSpread2({}, params), parameters);
 	if (isPlainObject(body)) {
-		params.headers = dist_objectSpread2({ "Content-Type": "application/json" }, options === null || options === void 0 ? void 0 : options.headers);
+		var _contentType;
+		const headers = (options === null || options === void 0 ? void 0 : options.headers) || {};
+		let contentType;
+		for (const [key, value] of Object.entries(headers)) if (key.toLowerCase() === "content-type") contentType = value;
+		params.headers = setRequestHeader(headers, "Content-Type", (_contentType = contentType) !== null && _contentType !== void 0 ? _contentType : "application/json");
 		params.body = JSON.stringify(body);
 	} else params.body = body;
 	if (options === null || options === void 0 ? void 0 : options.duplex) params.duplex = options.duplex;
 	return dist_objectSpread2(dist_objectSpread2({}, params), parameters);
 };
+function setRequestHeader(headers, name, value) {
+	const nextHeaders = dist_objectSpread2({}, headers);
+	for (const key of Object.keys(nextHeaders)) if (key.toLowerCase() === name.toLowerCase()) delete nextHeaders[key];
+	nextHeaders[name] = value;
+	return nextHeaders;
+}
 /**
 * Internal request handler that wraps fetch with error handling
 * @param fetcher - Fetch function to use
@@ -38577,7 +38823,7 @@ var BaseApiClient = class {
 	constructor(url, headers = {}, fetch$1, namespace = "storage") {
 		this.shouldThrowOnError = false;
 		this.url = url;
-		this.headers = headers;
+		this.headers = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
 		this.fetch = resolveFetch(fetch$1);
 		this.namespace = namespace;
 	}
@@ -38600,7 +38846,7 @@ var BaseApiClient = class {
 	* @returns this - For method chaining
 	*/
 	setHeader(name, value) {
-		this.headers = dist_objectSpread2(dist_objectSpread2({}, this.headers), {}, { [name]: value });
+		this.headers = dist_objectSpread2(dist_objectSpread2({}, this.headers), {}, { [name.toLowerCase()]: value });
 		return this;
 	}
 	/**
@@ -39102,6 +39348,7 @@ var StorageFileApi = class extends BaseApiClient {
 	* @param expiresIn The number of seconds until the signed URL expires. For example, `60` for a URL which is valid for one minute.
 	* @param options.download triggers the file as a download if set to true. Set this parameter as the name of the file if you want to trigger the download with a different filename.
 	* @param options.transform Transform the asset before serving it to the client.
+	* @param options.cacheNonce Append a cache nonce parameter to the URL to invalidate the cache.
 	* @returns Promise with response containing signed URL or error
 	*
 	* @example Create Signed URL
@@ -39157,9 +39404,12 @@ var StorageFileApi = class extends BaseApiClient {
 			let _path = _this8._getFinalPath(path);
 			const hasTransform = typeof (options === null || options === void 0 ? void 0 : options.transform) === "object" && options.transform !== null && Object.keys(options.transform).length > 0;
 			let data = await post(_this8.fetch, `${_this8.url}/object/sign/${_path}`, dist_objectSpread2({ expiresIn }, hasTransform ? { transform: options.transform } : {}), { headers: _this8.headers });
-			const downloadQueryParam = (options === null || options === void 0 ? void 0 : options.download) ? `&download=${options.download === true ? "" : options.download}` : "";
+			const query = new URLSearchParams();
+			if (options === null || options === void 0 ? void 0 : options.download) query.set("download", options.download === true ? "" : options.download);
+			if ((options === null || options === void 0 ? void 0 : options.cacheNonce) != null) query.set("cacheNonce", String(options.cacheNonce));
+			const queryString = query.toString();
 			const returnedPath = hasTransform && data.signedURL.includes("/object/sign/") ? data.signedURL.replace("/object/sign/", "/render/image/sign/") : data.signedURL;
-			return { signedUrl: encodeURI(`${_this8.url}${returnedPath}${downloadQueryParam}`) };
+			return { signedUrl: encodeURI(`${_this8.url}${returnedPath}${queryString ? `&${queryString}` : ""}`) };
 		});
 	}
 	/**
@@ -39169,6 +39419,7 @@ var StorageFileApi = class extends BaseApiClient {
 	* @param paths The file paths to be downloaded, including the current file names. For example `['folder/image.png', 'folder2/image2.png']`.
 	* @param expiresIn The number of seconds until the signed URLs expire. For example, `60` for URLs which are valid for one minute.
 	* @param options.download triggers the file as a download if set to true. Set this parameter as the name of the file if you want to trigger the download with a different filename.
+	* @param options.cacheNonce Append a cache nonce parameter to the URL to invalidate the cache.
 	* @returns Promise with response containing array of objects with signedUrl, path, and error or error
 	*
 	* @example Create Signed URLs
@@ -39213,8 +39464,11 @@ var StorageFileApi = class extends BaseApiClient {
 				expiresIn,
 				paths
 			}, { headers: _this9.headers });
-			const downloadQueryParam = (options === null || options === void 0 ? void 0 : options.download) ? `&download=${options.download === true ? "" : options.download}` : "";
-			return data.map((datum) => dist_objectSpread2(dist_objectSpread2({}, datum), {}, { signedUrl: datum.signedURL ? encodeURI(`${_this9.url}${datum.signedURL}${downloadQueryParam}`) : null }));
+			const query = new URLSearchParams();
+			if (options === null || options === void 0 ? void 0 : options.download) query.set("download", options.download === true ? "" : options.download);
+			if ((options === null || options === void 0 ? void 0 : options.cacheNonce) != null) query.set("cacheNonce", String(options.cacheNonce));
+			const queryString = query.toString();
+			return data.map((datum) => dist_objectSpread2(dist_objectSpread2({}, datum), {}, { signedUrl: datum.signedURL ? encodeURI(`${_this9.url}${datum.signedURL}${queryString ? `&${queryString}` : ""}`) : null }));
 		});
 	}
 	/**
@@ -39223,6 +39477,7 @@ var StorageFileApi = class extends BaseApiClient {
 	* @category File Buckets
 	* @param path The full path and file name of the file to be downloaded. For example `folder/image.png`.
 	* @param options.transform Transform the asset before serving it to the client.
+	* @param options.cacheNonce Append a cache nonce parameter to the URL to invalidate the cache.
 	* @param parameters Additional fetch parameters like signal for cancellation. Supports standard fetch options including cache control.
 	* @returns BlobDownloadBuilder instance for downloading the file
 	*
@@ -39283,10 +39538,12 @@ var StorageFileApi = class extends BaseApiClient {
 	*/
 	download(path, options, parameters) {
 		const renderPath = typeof (options === null || options === void 0 ? void 0 : options.transform) !== "undefined" ? "render/image/authenticated" : "object";
-		const transformationQuery = this.transformOptsToQueryString((options === null || options === void 0 ? void 0 : options.transform) || {});
-		const queryString = transformationQuery ? `?${transformationQuery}` : "";
+		const query = new URLSearchParams();
+		if (options === null || options === void 0 ? void 0 : options.transform) this.applyTransformOptsToQuery(query, options.transform);
+		if ((options === null || options === void 0 ? void 0 : options.cacheNonce) != null) query.set("cacheNonce", String(options.cacheNonce));
+		const queryString = query.toString();
 		const _path = this._getFinalPath(path);
-		const downloadFn = () => get(this.fetch, `${this.url}/${renderPath}/${_path}${queryString}`, {
+		const downloadFn = () => get(this.fetch, `${this.url}/${renderPath}/${_path}${queryString ? `?${queryString}` : ""}`, {
 			headers: this.headers,
 			noResolveJson: true
 		}, parameters);
@@ -39367,6 +39624,7 @@ var StorageFileApi = class extends BaseApiClient {
 	* @param path The path and name of the file to generate the public URL for. For example `folder/image.png`.
 	* @param options.download Triggers the file as a download if set to true. Set this parameter as the name of the file if you want to trigger the download with a different filename.
 	* @param options.transform Transform the asset before serving it to the client.
+	* @param options.cacheNonce Append a cache nonce parameter to the URL to invalidate the cache.
 	* @returns Object with public URL
 	*
 	* @example Returns the URL for an asset in a public bucket
@@ -39418,15 +39676,13 @@ var StorageFileApi = class extends BaseApiClient {
 	*/
 	getPublicUrl(path, options) {
 		const _path = this._getFinalPath(path);
-		const _queryString = [];
-		const downloadQueryParam = (options === null || options === void 0 ? void 0 : options.download) ? `download=${options.download === true ? "" : options.download}` : "";
-		if (downloadQueryParam !== "") _queryString.push(downloadQueryParam);
+		const query = new URLSearchParams();
+		if (options === null || options === void 0 ? void 0 : options.download) query.set("download", options.download === true ? "" : options.download);
+		if (options === null || options === void 0 ? void 0 : options.transform) this.applyTransformOptsToQuery(query, options.transform);
+		if ((options === null || options === void 0 ? void 0 : options.cacheNonce) != null) query.set("cacheNonce", String(options.cacheNonce));
+		const queryString = query.toString();
 		const renderPath = typeof (options === null || options === void 0 ? void 0 : options.transform) !== "undefined" ? "render/image" : "object";
-		const transformationQuery = this.transformOptsToQueryString((options === null || options === void 0 ? void 0 : options.transform) || {});
-		if (transformationQuery !== "") _queryString.push(transformationQuery);
-		let queryString = _queryString.join("&");
-		if (queryString !== "") queryString = `?${queryString}`;
-		return { data: { publicUrl: encodeURI(`${this.url}/${renderPath}/public/${_path}${queryString}`) } };
+		return { data: { publicUrl: encodeURI(`${this.url}/${renderPath}/public/${_path}`) + (queryString ? `?${queryString}` : "") } };
 	}
 	/**
 	* Deletes files within the same bucket
@@ -39629,20 +39885,20 @@ var StorageFileApi = class extends BaseApiClient {
 	_removeEmptyFolders(path) {
 		return path.replace(/^\/|\/$/g, "").replace(/\/+/g, "/");
 	}
-	transformOptsToQueryString(transform) {
-		const params = [];
-		if (transform.width) params.push(`width=${transform.width}`);
-		if (transform.height) params.push(`height=${transform.height}`);
-		if (transform.resize) params.push(`resize=${transform.resize}`);
-		if (transform.format) params.push(`format=${transform.format}`);
-		if (transform.quality) params.push(`quality=${transform.quality}`);
-		return params.join("&");
+	/** Modifies the `query`, appending values the from `transform` */
+	applyTransformOptsToQuery(query, transform) {
+		if (transform.width) query.set("width", transform.width.toString());
+		if (transform.height) query.set("height", transform.height.toString());
+		if (transform.resize) query.set("resize", transform.resize);
+		if (transform.format) query.set("format", transform.format);
+		if (transform.quality) query.set("quality", transform.quality.toString());
+		return query;
 	}
 };
 
 //#endregion
 //#region src/lib/version.ts
-const version = "2.100.1";
+const version = "2.103.0";
 
 //#endregion
 //#region src/lib/constants.ts
@@ -41053,7 +41309,7 @@ var auth_js_dist_main = __nccwpck_require__(6748);
 
 
 //#region src/lib/version.ts
-const dist_version = "2.100.1";
+const dist_version = "2.103.0";
 
 //#endregion
 //#region src/lib/constants.ts
