@@ -1,7 +1,7 @@
 > [!WARNING]
 > This repo is archived. It won't receive new features, bug fixes, or security updates.
 >
-> Published releases (up to `v0.0.6`) stay available on the [GitHub Marketplace](https://github.com/marketplace/actions/supabase-embeddings-generator). Pin to the version you're already on and it'll keep working.
+> Published releases (up to `v0.0.6`) stay available on the [GitHub Marketplace](https://github.com/marketplace/actions/supabase-embeddings-generator) and will keep working.
 
 ---
 
