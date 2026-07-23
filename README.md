@@ -13,8 +13,6 @@ This action is a companion to the [`headless-vector-search`](https://github.com/
 
 ## Usage
 
-You can find this action on the [GitHub Marketplace](https://github.com/marketplace/actions/supabase-embeddings-generator).
-
 In your knowledge base repository, create a new action called `.github/workflows/generate_embeddings.yml` with the following content:
 
 ```yml
@@ -29,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: supabase/embeddings-generator@v0.x.x # Find the latest version in the Marketplace
+      - uses: supabase/embeddings-generator@v0.x.x # Find the latest version in the repo's releases
         with:
           supabase-url: 'https://your-project-ref.supabase.co'
           supabase-service-role-key: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
